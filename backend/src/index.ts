@@ -51,11 +51,32 @@ const riskKeywords = [
   "昏迷",
   "剧烈头痛",
   "肚子痛得厉害",
-  "心慌"
+  "心慌",
+  "chest pain",
+  "shortness of breath",
+  "fainted"
+];
+
+const riskPatterns: RegExp[] = [
+  /胸.*痛/,
+  /胸口.*痛/,
+  /呼吸.*困难/,
+  /喘不上气/,
+  /晕倒/,
+  /昏迷/,
+  /头.*剧烈.*痛/,
+  /肚子.*痛.*厉害/,
+  /心慌/,
+  /chest\s*pain/i,
+  /shortness\s*of\s*breath/i
 ];
 
 function detectRisk(text: string): boolean {
-  return riskKeywords.some((word) => text.includes(word));
+  const normalized = text.replace(/\s+/g, "");
+  return (
+    riskKeywords.some((word) => normalized.toLowerCase().includes(word)) ||
+    riskPatterns.some((pattern) => pattern.test(normalized))
+  );
 }
 
 function buildReply(text: string, risk: boolean): string {
@@ -211,4 +232,3 @@ app.get("/api/family/summary", (_req: Request, res: Response) => {
 app.listen(PORT, () => {
   console.log(`backend started on :${PORT}`);
 });
-
