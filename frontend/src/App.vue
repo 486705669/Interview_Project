@@ -49,6 +49,8 @@ const listening = ref(false);
 const loading = ref(false);
 const emergencyMode = ref(false);
 const chatInput = ref("");
+const voiceStatus = ref("");
+
 const reminders = ref<Reminder[]>([]);
 const messages = ref<ChatMessage[]>([]);
 const emergencies = ref<EmergencyEvent[]>([]);
@@ -59,14 +61,39 @@ const familySummary = ref<FamilySummary>({
 });
 const familyTimeline = ref<TimelineItem[]>([]);
 const selectedEvent = ref<EmergencyEvent | null>(null);
+
 const newReminderTitle = ref("");
 const newReminderTime = ref("");
 
 let recognition: SpeechRecognition | null = null;
 
+const isSecureOrigin = computed(() => {
+  return (
+    window.isSecureContext ||
+    ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)
+  );
+});
+
 const canUseSpeechRecognition = computed(() => {
   const withKit = window as unknown as { webkitSpeechRecognition?: unknown };
   return Boolean(window.SpeechRecognition || withKit.webkitSpeechRecognition);
+});
+
+const voiceButtonDisabled = computed(() => {
+  return !canUseSpeechRecognition.value;
+});
+
+const voiceTip = computed(() => {
+  if (voiceStatus.value) {
+    return voiceStatus.value;
+  }
+  if (!canUseSpeechRecognition.value) {
+    return "当前浏览器不支持语音识别，请改用文字输入。建议 Android Chrome。";
+  }
+  if (!isSecureOrigin.value) {
+    return "当前是非 HTTPS 页面，部分手机浏览器会阻止麦克风。";
+  }
+  return "点击“按下开始语音”后说话，再点一次结束。";
 });
 
 function formatTime(value: string): string {
@@ -96,7 +123,6 @@ function createRecognition(): SpeechRecognition | null {
   };
   const SpeechRecognitionCtor =
     window.SpeechRecognition || withKit.webkitSpeechRecognition;
-
   if (!SpeechRecognitionCtor) {
     return null;
   }
@@ -105,16 +131,35 @@ function createRecognition(): SpeechRecognition | null {
   rec.lang = "zh-CN";
   rec.interimResults = false;
   rec.maxAlternatives = 1;
+  rec.onstart = () => {
+    listening.value = true;
+    voiceStatus.value = "正在听，请开始说话。";
+  };
   rec.onresult = (event: SpeechRecognitionEvent) => {
     const transcript = event.results?.[0]?.[0]?.transcript?.trim() ?? "";
     if (!transcript) {
+      voiceStatus.value = "没有识别到语音，请重试。";
       return;
     }
     chatInput.value = transcript;
+    voiceStatus.value = `已识别：${transcript}`;
     void sendMessage();
   };
-  rec.onerror = () => {
+  rec.onerror = (event: SpeechRecognitionErrorEvent) => {
     listening.value = false;
+    if (event.error === "not-allowed") {
+      voiceStatus.value = "麦克风权限被拒绝，请在浏览器设置中允许麦克风。";
+      return;
+    }
+    if (event.error === "no-speech") {
+      voiceStatus.value = "未检测到语音输入，请靠近麦克风再试一次。";
+      return;
+    }
+    if (event.error === "network") {
+      voiceStatus.value = "语音识别网络异常，请检查网络后重试。";
+      return;
+    }
+    voiceStatus.value = `语音识别失败：${event.error}`;
   };
   rec.onend = () => {
     listening.value = false;
@@ -123,18 +168,55 @@ function createRecognition(): SpeechRecognition | null {
   return recognition;
 }
 
-function toggleListening(): void {
-  const rec = createRecognition();
-  if (!rec) {
+async function ensureMicPermission(): Promise<boolean> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    voiceStatus.value = "浏览器未提供麦克风权限接口，请使用 HTTPS 或系统浏览器。";
+    return false;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+    return true;
+  } catch (_error) {
+    voiceStatus.value = "无法获取麦克风权限，请检查浏览器权限设置。";
+    return false;
+  }
+}
+
+async function toggleListening(): Promise<void> {
+  if (!canUseSpeechRecognition.value) {
+    voiceStatus.value = "当前浏览器不支持语音识别。";
     return;
   }
+
+  if (!isSecureOrigin.value) {
+    voiceStatus.value = "建议改为 HTTPS 访问，否则部分手机会禁用麦克风。";
+  }
+
+  const rec = createRecognition();
+  if (!rec) {
+    voiceStatus.value = "语音引擎初始化失败。";
+    return;
+  }
+
   if (listening.value) {
     rec.stop();
     listening.value = false;
+    voiceStatus.value = "已停止录音。";
     return;
   }
-  listening.value = true;
-  rec.start();
+
+  const permissionOk = await ensureMicPermission();
+  if (!permissionOk) {
+    return;
+  }
+
+  try {
+    rec.start();
+  } catch (_error) {
+    voiceStatus.value = "语音启动失败，请刷新页面重试。";
+  }
 }
 
 async function fetchLogs(): Promise<void> {
@@ -382,14 +464,12 @@ onMounted(async () => {
       <button
         class="voice"
         type="button"
-        :disabled="!canUseSpeechRecognition"
+        :disabled="voiceButtonDisabled"
         @click="toggleListening"
       >
         {{ listening ? "停止说话" : "按下开始语音" }}
       </button>
-      <p v-if="!canUseSpeechRecognition" class="tips">
-        当前浏览器不支持语音识别，可使用文字输入。
-      </p>
+      <p class="tips">{{ voiceTip }}</p>
     </section>
 
     <section v-if="activeTab === 'reminder'" class="panel">
