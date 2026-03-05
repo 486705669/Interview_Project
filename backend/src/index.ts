@@ -3,6 +3,8 @@ import express, { type Request, type Response } from "express";
 
 type Role = "user" | "assistant";
 type ReminderStatus = "pending" | "done" | "snooze" | "skip";
+type EmergencySource = "keyword" | "manual";
+type EmergencyStatus = "open" | "resolved";
 
 interface ChatMessage {
   id: number;
@@ -21,11 +23,20 @@ interface Reminder {
 
 interface EmergencyEvent {
   id: number;
-  source: "keyword" | "manual";
+  source: EmergencySource;
   triggerText: string;
   createdAt: string;
-  status: "open" | "resolved";
+  status: EmergencyStatus;
   actionLog: string[];
+}
+
+interface FamilyTimelineItem {
+  id: string;
+  type: "chat" | "reminder" | "emergency";
+  title: string;
+  description: string;
+  createdAt: string;
+  level: "normal" | "warning";
 }
 
 const app = express();
@@ -33,7 +44,6 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
-
 const messages: ChatMessage[] = [];
 const reminders: Reminder[] = [];
 const emergencies: EmergencyEvent[] = [];
@@ -42,57 +52,65 @@ let messageId = 1;
 let reminderId = 1;
 let emergencyId = 1;
 
-const riskKeywords = [
-  "胸痛",
-  "胸口痛",
-  "呼吸困难",
-  "喘不上气",
-  "晕倒",
-  "昏迷",
-  "剧烈头痛",
-  "肚子痛得厉害",
-  "心慌",
+const riskKeywordFragments = [
+  "\u80f8\u75db",
+  "\u80f8\u53e3\u75db",
+  "\u547c\u5438\u56f0\u96be",
+  "\u5598\u4e0d\u4e0a\u6c14",
+  "\u6655\u5012",
+  "\u660f\u8ff7",
+  "\u5267\u70c8\u5934\u75db",
+  "\u809a\u5b50\u75db\u5f97\u5389\u5bb3",
+  "\u5fc3\u614c",
   "chest pain",
   "shortness of breath",
   "fainted"
 ];
 
 const riskPatterns: RegExp[] = [
-  /胸.*痛/,
-  /胸口.*痛/,
-  /呼吸.*困难/,
-  /喘不上气/,
-  /晕倒/,
-  /昏迷/,
-  /头.*剧烈.*痛/,
-  /肚子.*痛.*厉害/,
-  /心慌/,
+  /\u80f8.*\u75db/u,
+  /\u80f8\u53e3.*\u75db/u,
+  /\u547c\u5438.*\u56f0\u96be/u,
+  /\u5598\u4e0d\u4e0a\u6c14/u,
+  /\u6655\u5012/u,
+  /\u660f\u8ff7/u,
+  /\u5934.*\u5267\u70c8.*\u75db/u,
+  /\u809a\u5b50.*\u75db.*\u5389\u5bb3/u,
+  /\u5fc3\u614c/u,
   /chest\s*pain/i,
   /shortness\s*of\s*breath/i
 ];
 
 function detectRisk(text: string): boolean {
-  const normalized = text.replace(/\s+/g, "");
+  const normalized = text.replace(/\s+/g, "").toLowerCase();
   return (
-    riskKeywords.some((word) => normalized.toLowerCase().includes(word)) ||
+    riskKeywordFragments.some((part) => normalized.includes(part.toLowerCase())) ||
     riskPatterns.some((pattern) => pattern.test(normalized))
   );
 }
 
 function buildReply(text: string, risk: boolean): string {
   if (risk) {
-    return "我听到您可能有紧急不适。请优先拨打120，或立即联系紧急联系人。我会继续陪着您。";
+    return "\u6211\u542c\u5230\u60a8\u53ef\u80fd\u6709\u7d27\u6025\u4e0d\u9002\u3002\u8bf7\u4f18\u5148\u62e8\u6253120\uff0c\u6216\u7acb\u5373\u8054\u7cfb\u7d27\u6025\u8054\u7cfb\u4eba\u3002";
   }
 
-  if (text.includes("提醒") || text.includes("吃药") || text.includes("喝水")) {
-    return "好的，我可以帮您记录提醒。您也可以去“提醒”页直接新增。";
+  if (
+    text.includes("\u63d0\u9192") ||
+    text.includes("\u5403\u836f") ||
+    text.includes("\u559d\u6c34")
+  ) {
+    return "\u597d\u7684\uff0c\u6211\u53ef\u4ee5\u5e2e\u60a8\u8bb0\u5f55\u63d0\u9192\u3002\u4e5f\u53ef\u4ee5\u5728\u63d0\u9192\u9875\u9762\u624b\u52a8\u65b0\u589e\u3002";
   }
 
-  if (text.includes("孤单") || text.includes("无聊") || text.includes("难过")) {
-    return "我在这儿陪您。要不要聊聊今天发生的事，或者一起听听您喜欢的话题？";
+  if (
+    text.includes("\u5b64\u5355") ||
+    text.includes("\u65e0\u804a") ||
+    text.includes("\u96be\u8fc7")
+  ) {
+    return "\u6211\u5728\u8fd9\u91cc\u966a\u60a8\u3002\u60a8\u53ef\u4ee5\u7ee7\u7eed\u8bf4\uff0c\u6211\u4f1a\u8010\u5fc3\u542c\u3002";
   }
 
-  return "我听到了。您可以继续说，我会一步一步陪您处理。";
+  return "\u6211\u542c\u5230\u4e86\u3002\u60a8\u53ef\u4ee5\u7ee7\u7eed\u8bf4\uff0c\u6211\u4f1a\u4e00\u6b65\u6b65\u966a\u60a8\u5904\u7406\u3002";
 }
 
 function addChat(role: Role, text: string, risk = false): void {
@@ -105,20 +123,50 @@ function addChat(role: Role, text: string, risk = false): void {
   });
 }
 
-function createEmergency(
-  source: "keyword" | "manual",
-  triggerText: string
-): EmergencyEvent {
+function createEmergency(source: EmergencySource, triggerText: string): EmergencyEvent {
   const event: EmergencyEvent = {
     id: emergencyId++,
     source,
     triggerText,
     createdAt: new Date().toISOString(),
     status: "open",
-    actionLog: ["创建事件"]
+    actionLog: ["\u521b\u5efa\u4e8b\u4ef6"]
   };
   emergencies.unshift(event);
   return event;
+}
+
+function buildFamilyTimeline(): FamilyTimelineItem[] {
+  const chatItems: FamilyTimelineItem[] = messages.slice(-40).map((item) => ({
+    id: `chat-${item.id}`,
+    type: "chat",
+    title: item.role === "user" ? "\u7528\u6237\u5bf9\u8bdd" : "\u52a9\u624b\u56de\u590d",
+    description: item.text,
+    createdAt: item.createdAt,
+    level: item.risk ? "warning" : "normal"
+  }));
+
+  const reminderItems: FamilyTimelineItem[] = reminders.map((item) => ({
+    id: `reminder-${item.id}`,
+    type: "reminder",
+    title: "\u63d0\u9192\u4e8b\u9879",
+    description: `${item.title} · ${item.status}`,
+    createdAt: item.time,
+    level: item.status === "pending" ? "warning" : "normal"
+  }));
+
+  const emergencyItems: FamilyTimelineItem[] = emergencies.map((item) => ({
+    id: `emergency-${item.id}`,
+    type: "emergency",
+    title: "\u7d27\u6025\u4e8b\u4ef6",
+    description: item.triggerText,
+    createdAt: item.createdAt,
+    level: "warning"
+  }));
+
+  return [...chatItems, ...reminderItems, ...emergencyItems].sort((a, b) =>
+    b.createdAt.localeCompare(a.createdAt)
+  );
 }
 
 app.get("/api/health", (_req: Request, res: Response) => {
@@ -200,15 +248,25 @@ app.get("/api/emergencies", (_req: Request, res: Response) => {
   res.json({ items: emergencies });
 });
 
+app.get("/api/emergencies/:id", (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const event = emergencies.find((item) => item.id === id);
+  if (!event) {
+    res.status(404).json({ error: "event not found" });
+    return;
+  }
+  res.json({ item: event });
+});
+
 app.post("/api/emergencies/manual", (req: Request, res: Response) => {
   const triggerText = String(req.body?.triggerText ?? "").trim();
-  const event = createEmergency("manual", triggerText || "用户手动触发");
+  const event = createEmergency("manual", triggerText || "\u7528\u6237\u624b\u52a8\u89e6\u53d1");
   res.status(201).json({ item: event });
 });
 
 app.patch("/api/emergencies/:id/resolve", (req: Request, res: Response) => {
   const id = Number(req.params.id);
-  const actionText = String(req.body?.actionText ?? "标记为已处理");
+  const actionText = String(req.body?.actionText ?? "\u6807\u8bb0\u4e3a\u5df2\u5904\u7406");
   const event = emergencies.find((item) => item.id === id);
   if (!event) {
     res.status(404).json({ error: "event not found" });
@@ -227,6 +285,11 @@ app.get("/api/family/summary", (_req: Request, res: Response) => {
     openEmergencies,
     pendingReminders
   });
+});
+
+app.get("/api/family/timeline", (_req: Request, res: Response) => {
+  const items = buildFamilyTimeline().slice(0, 100);
+  res.json({ items });
 });
 
 app.listen(PORT, () => {
