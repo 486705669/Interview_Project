@@ -1,20 +1,55 @@
-# 老人陪伴助手（面试项目）
+# Elderly Companion Assistant (Interview MVP)
 
-本项目目标：在 3 天内交付一个可在手机浏览器访问的“语音陪伴 + 提醒 + 应急引导 + 记录追溯”MVP。
+This repository contains a 3-day MVP for a mobile web product:
+- voice-first chat companion
+- reminder assistant
+- emergency guidance mode
+- family/admin traceable logs
 
-## 文档入口
-- [PRD（MVP）](./docs/PRD-老人陪伴助手.md)
-- [三天落地执行方案](./docs/三天落地执行方案.md)
+## Docs
+- [Product PRD](./docs/PRD-老人陪伴助手.md)
+- [3-Day Delivery Plan](./docs/三天落地执行方案.md)
 
-## 当前交付状态
-- [x] 产品 PRD（功能、流程、页面、合规边界）
-- [x] 三天开发排期与部署方案
-- [ ] 前端应用（老人端）
-- [ ] 后端 API
-- [ ] 部署配置（Docker + Nginx）
+## Project Structure
+```text
+.
+├─ frontend/   # Vue 3 mobile web
+├─ backend/    # Express API service
+├─ deploy/     # Docker Compose + Nginx gateway
+└─ docs/       # PRD and planning docs
+```
 
-## 面试演示建议
-1. 展示 PRD 中的核心链路（陪聊、提醒、应急、追溯）
-2. 按执行方案展示 3 天节奏与风险控制
-3. 现场演示移动端访问与关键流程
+## Local Development
+### 1) Start backend
+```bash
+cd backend
+npm install
+npm run dev
+```
+
+### 2) Start frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173` on desktop or mobile browser in the same LAN.
+
+## Docker Deployment
+```bash
+cd deploy
+cp ../.env.example ../.env
+docker compose up -d --build
+```
+
+Then open:
+- `http://<your-server-ip>` for web
+- `http://<your-server-ip>/api/health` for API health check
+
+## Current MVP Status
+- [x] PRD and delivery plan
+- [x] Frontend mobile pages (chat/reminder/logs)
+- [x] Backend APIs (chat/risk detection/reminder/emergency/logs)
+- [x] Docker deployment files (frontend + backend + nginx gateway)
 
