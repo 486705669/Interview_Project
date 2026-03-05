@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 
-type Tab = "chat" | "reminder" | "logs";
+type Tab = "chat" | "reminder" | "logs" | "family" | "eventDetail";
 type ReminderStatus = "pending" | "done" | "snooze" | "skip";
 
 interface ChatMessage {
@@ -24,7 +24,23 @@ interface EmergencyEvent {
   source: string;
   triggerText: string;
   createdAt: string;
-  status: string;
+  status: "open" | "resolved";
+  actionLog: string[];
+}
+
+interface FamilySummary {
+  totalMessages: number;
+  openEmergencies: number;
+  pendingReminders: number;
+}
+
+interface TimelineItem {
+  id: string;
+  type: "chat" | "reminder" | "emergency";
+  title: string;
+  description: string;
+  createdAt: string;
+  level: "normal" | "warning";
 }
 
 const apiBase = import.meta.env.VITE_API_BASE ?? "/api";
@@ -36,6 +52,13 @@ const chatInput = ref("");
 const reminders = ref<Reminder[]>([]);
 const messages = ref<ChatMessage[]>([]);
 const emergencies = ref<EmergencyEvent[]>([]);
+const familySummary = ref<FamilySummary>({
+  totalMessages: 0,
+  openEmergencies: 0,
+  pendingReminders: 0
+});
+const familyTimeline = ref<TimelineItem[]>([]);
+const selectedEvent = ref<EmergencyEvent | null>(null);
 const newReminderTitle = ref("");
 const newReminderTime = ref("");
 
@@ -114,65 +137,6 @@ function toggleListening(): void {
   rec.start();
 }
 
-async function sendMessage(): Promise<void> {
-  const text = chatInput.value.trim();
-  if (!text || loading.value) {
-    return;
-  }
-
-  const optimisticId = Date.now();
-  messages.value.push({
-    id: optimisticId,
-    role: "user",
-    text,
-    createdAt: new Date().toISOString()
-  });
-  chatInput.value = "";
-  loading.value = true;
-
-  try {
-    const response = await fetch(`${apiBase}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text })
-    });
-
-    if (!response.ok) {
-      throw new Error("chat request failed");
-    }
-
-    const data = (await response.json()) as {
-      reply: string;
-      risk: boolean;
-    };
-
-    messages.value.push({
-      id: optimisticId + 1,
-      role: "assistant",
-      text: data.reply,
-      createdAt: new Date().toISOString(),
-      risk: data.risk
-    });
-
-    if (data.risk) {
-      emergencyMode.value = true;
-      activeTab.value = "chat";
-    }
-
-    speak(data.reply);
-    await Promise.all([fetchReminders(), fetchEmergencies(), fetchLogs()]);
-  } catch (_error) {
-    messages.value.push({
-      id: optimisticId + 2,
-      role: "assistant",
-      text: "我暂时连不上服务，请稍后再试。",
-      createdAt: new Date().toISOString()
-    });
-  } finally {
-    loading.value = false;
-  }
-}
-
 async function fetchLogs(): Promise<void> {
   const response = await fetch(`${apiBase}/logs`);
   if (!response.ok) {
@@ -200,6 +164,86 @@ async function fetchEmergencies(): Promise<void> {
   emergencies.value = data.items;
 }
 
+async function fetchFamilyData(): Promise<void> {
+  const [summaryResponse, timelineResponse] = await Promise.all([
+    fetch(`${apiBase}/family/summary`),
+    fetch(`${apiBase}/family/timeline`)
+  ]);
+
+  if (summaryResponse.ok) {
+    familySummary.value = (await summaryResponse.json()) as FamilySummary;
+  }
+
+  if (timelineResponse.ok) {
+    const data = (await timelineResponse.json()) as { items: TimelineItem[] };
+    familyTimeline.value = data.items;
+  }
+}
+
+async function refreshAll(): Promise<void> {
+  await Promise.all([
+    fetchLogs(),
+    fetchReminders(),
+    fetchEmergencies(),
+    fetchFamilyData()
+  ]);
+}
+
+async function sendMessage(): Promise<void> {
+  const text = chatInput.value.trim();
+  if (!text || loading.value) {
+    return;
+  }
+
+  const optimisticId = Date.now();
+  messages.value.push({
+    id: optimisticId,
+    role: "user",
+    text,
+    createdAt: new Date().toISOString()
+  });
+  chatInput.value = "";
+  loading.value = true;
+
+  try {
+    const response = await fetch(`${apiBase}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text })
+    });
+
+    if (!response.ok) {
+      throw new Error("chat request failed");
+    }
+
+    const data = (await response.json()) as { reply: string; risk: boolean };
+    messages.value.push({
+      id: optimisticId + 1,
+      role: "assistant",
+      text: data.reply,
+      createdAt: new Date().toISOString(),
+      risk: data.risk
+    });
+
+    if (data.risk) {
+      emergencyMode.value = true;
+      activeTab.value = "chat";
+    }
+
+    speak(data.reply);
+    await refreshAll();
+  } catch (_error) {
+    messages.value.push({
+      id: optimisticId + 2,
+      role: "assistant",
+      text: "我暂时连不上服务，请稍后再试。",
+      createdAt: new Date().toISOString()
+    });
+  } finally {
+    loading.value = false;
+  }
+}
+
 async function createReminder(): Promise<void> {
   const title = newReminderTitle.value.trim();
   const time = newReminderTime.value.trim();
@@ -213,7 +257,7 @@ async function createReminder(): Promise<void> {
   });
   newReminderTitle.value = "";
   newReminderTime.value = "";
-  await fetchReminders();
+  await refreshAll();
 }
 
 async function ackReminder(id: number, action: ReminderStatus): Promise<void> {
@@ -222,7 +266,7 @@ async function ackReminder(id: number, action: ReminderStatus): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action })
   });
-  await fetchReminders();
+  await refreshAll();
 }
 
 async function triggerManualEmergency(): Promise<void> {
@@ -234,11 +278,34 @@ async function triggerManualEmergency(): Promise<void> {
   emergencyMode.value = true;
   activeTab.value = "chat";
   speak("已进入紧急模式，请优先拨打120或联系家属。");
-  await fetchEmergencies();
+  await refreshAll();
+}
+
+async function openEmergencyDetail(id: number): Promise<void> {
+  const response = await fetch(`${apiBase}/emergencies/${id}`);
+  if (!response.ok) {
+    return;
+  }
+  const data = (await response.json()) as { item: EmergencyEvent };
+  selectedEvent.value = data.item;
+  activeTab.value = "eventDetail";
+}
+
+async function resolveSelectedEmergency(): Promise<void> {
+  if (!selectedEvent.value) {
+    return;
+  }
+  await fetch(`${apiBase}/emergencies/${selectedEvent.value.id}/resolve`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ actionText: "家属/后台确认已处理" })
+  });
+  await openEmergencyDetail(selectedEvent.value.id);
+  await refreshAll();
 }
 
 onMounted(async () => {
-  await Promise.all([fetchLogs(), fetchReminders(), fetchEmergencies()]);
+  await refreshAll();
 });
 </script>
 
@@ -280,6 +347,13 @@ onMounted(async () => {
         @click="activeTab = 'logs'"
       >
         记录
+      </button>
+      <button
+        type="button"
+        :class="{ active: activeTab === 'family' }"
+        @click="activeTab = 'family'"
+      >
+        家属/后台
       </button>
     </nav>
 
@@ -340,15 +414,92 @@ onMounted(async () => {
     </section>
 
     <section v-if="activeTab === 'logs'" class="panel">
-      <h2>应急记录</h2>
+      <div class="topbar">
+        <h2>应急记录</h2>
+      </div>
       <ul class="list">
         <li v-for="item in emergencies" :key="item.id" class="list-item">
           <div>
             <strong>{{ item.triggerText }}</strong>
             <p>{{ formatTime(item.createdAt) }} · {{ item.status }} · {{ item.source }}</p>
           </div>
+          <div class="actions">
+            <button type="button" @click="openEmergencyDetail(item.id)">查看详情</button>
+          </div>
         </li>
       </ul>
+    </section>
+
+    <section v-if="activeTab === 'family'" class="panel family-panel">
+      <div class="topbar">
+        <h2>家属/后台查询</h2>
+        <button type="button" @click="fetchFamilyData">刷新</button>
+      </div>
+
+      <div class="summary-grid">
+        <article class="metric">
+          <p>总对话数</p>
+          <strong>{{ familySummary.totalMessages }}</strong>
+        </article>
+        <article class="metric warning">
+          <p>未关闭应急</p>
+          <strong>{{ familySummary.openEmergencies }}</strong>
+        </article>
+        <article class="metric warning">
+          <p>待执行提醒</p>
+          <strong>{{ familySummary.pendingReminders }}</strong>
+        </article>
+      </div>
+
+      <h3>关键时间线</h3>
+      <ul class="list">
+        <li
+          v-for="item in familyTimeline"
+          :key="item.id"
+          class="list-item"
+          :class="{ warning: item.level === 'warning' }"
+        >
+          <div>
+            <strong>{{ item.title }}</strong>
+            <p>{{ item.description }}</p>
+            <p>{{ formatTime(item.createdAt) }} · {{ item.type }}</p>
+          </div>
+          <div v-if="item.type === 'emergency'" class="actions">
+            <button type="button" @click="openEmergencyDetail(Number(item.id.split('-')[1]))">
+              查看详情
+            </button>
+          </div>
+        </li>
+      </ul>
+    </section>
+
+    <section v-if="activeTab === 'eventDetail'" class="panel">
+      <div class="topbar">
+        <h2>应急事件详情</h2>
+        <button type="button" @click="activeTab = 'family'">返回</button>
+      </div>
+
+      <div v-if="selectedEvent" class="detail-card">
+        <p><strong>事件ID：</strong>{{ selectedEvent.id }}</p>
+        <p><strong>触发来源：</strong>{{ selectedEvent.source }}</p>
+        <p><strong>触发语句：</strong>{{ selectedEvent.triggerText }}</p>
+        <p><strong>创建时间：</strong>{{ formatTime(selectedEvent.createdAt) }}</p>
+        <p><strong>当前状态：</strong>{{ selectedEvent.status }}</p>
+        <h3>处置动作日志</h3>
+        <ul class="list">
+          <li v-for="(action, index) in selectedEvent.actionLog" :key="index" class="list-item">
+            {{ action }}
+          </li>
+        </ul>
+        <button
+          type="button"
+          class="primary"
+          :disabled="selectedEvent.status === 'resolved'"
+          @click="resolveSelectedEmergency"
+        >
+          {{ selectedEvent.status === "resolved" ? "已处理" : "标记为已处理" }}
+        </button>
+      </div>
     </section>
   </main>
 </template>
