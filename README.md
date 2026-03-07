@@ -10,6 +10,7 @@ This repository contains a 3-day MVP for a mobile web product:
 ## Docs
 - `docs/PRD-老人陪伴助手.md`
 - `docs/三天落地执行方案.md`
+- `docs/Cloudflare-named-tunnel部署.md`
 
 ## Project Structure
 ```text
@@ -17,18 +18,16 @@ This repository contains a 3-day MVP for a mobile web product:
 |- frontend/   # Vue 3 mobile web
 |- backend/    # Express API service
 |- deploy/     # Docker Compose + Nginx gateway
-`- docs/       # PRD and planning docs
+`- docs/       # PRD and deployment docs
 ```
 
 ## Local Development
-### 1) Start backend
 ```bash
 cd backend
 npm install
 npm run dev
 ```
 
-### 2) Start frontend
 ```bash
 cd frontend
 npm install
@@ -37,25 +36,33 @@ npm run dev
 
 Open `http://localhost:5173` on desktop or mobile browser in the same LAN.
 
-## Docker Deployment
+## Standard Docker Deployment
 ```bash
 cd deploy
 docker compose up -d --build
 ```
 
-Then open:
-- `http://<your-server-ip>` for web
-- `http://<your-server-ip>/api/health` for API health check
+## Cloudflare Named Tunnel Deployment
+1. Create a named tunnel in Cloudflare Zero Trust and copy the Docker token.
+2. Add a public hostname in Cloudflare that points to `http://gateway:80`.
+3. Create `.env.cloudflare` from `.env.cloudflare.example`.
+4. Start with:
 
-Stop services:
 ```bash
 cd deploy
-docker compose down
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.cloudflare.yml \
+  --env-file ../.env.cloudflare \
+  up -d --build
 ```
+
+See `docs/Cloudflare-named-tunnel部署.md` for the full flow.
 
 ## Current MVP Status
 - [x] PRD and delivery plan
 - [x] Frontend pages: chat / reminder / logs / family dashboard / emergency detail
 - [x] Backend APIs: chat, risk detection, reminders, emergencies, family summary, timeline
 - [x] Docker deployment: frontend + backend + nginx gateway
+- [x] Cloudflare named tunnel deployment template
 
