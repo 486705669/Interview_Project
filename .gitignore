@@ -4,3 +4,4 @@ dist/
 .env.cloudflare
 .DS_Store
 *.log
+deploy/windows/cloudflared-token.txt

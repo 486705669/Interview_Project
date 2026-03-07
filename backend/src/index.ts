@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express, { type Request, type Response } from "express";
 
@@ -44,6 +47,10 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const frontendDistDir =
+  process.env.FRONTEND_DIST_DIR ?? path.resolve(currentDir, "../../frontend/dist");
+const hasFrontendBuild = fs.existsSync(frontendDistDir);
 const messages: ChatMessage[] = [];
 const reminders: Reminder[] = [];
 const emergencies: EmergencyEvent[] = [];
@@ -291,6 +298,19 @@ app.get("/api/family/timeline", (_req: Request, res: Response) => {
   const items = buildFamilyTimeline().slice(0, 100);
   res.json({ items });
 });
+
+if (hasFrontendBuild) {
+  app.use(express.static(frontendDistDir));
+
+  app.get("*", (req: Request, res: Response, next) => {
+    if (req.path.startsWith("/api/")) {
+      next();
+      return;
+    }
+
+    res.sendFile(path.join(frontendDistDir, "index.html"));
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`backend started on :${PORT}`);

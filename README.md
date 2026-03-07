@@ -11,6 +11,7 @@ This repository contains a 3-day MVP for a mobile web product:
 - `docs/PRD-老人陪伴助手.md`
 - `docs/三天落地执行方案.md`
 - `docs/Cloudflare-named-tunnel部署.md`
+- `docs/Aliyun-ECS-Windows-deployment.md`
 
 ## Project Structure
 ```text
@@ -59,10 +60,14 @@ docker compose \
 
 See `docs/Cloudflare-named-tunnel部署.md` for the full flow.
 
+## Aliyun ECS Windows Deployment
+For a Windows ECS host, use the Windows scripts in `deploy/windows/` and point the Cloudflare named tunnel to `http://localhost:3000`.
+
+See `docs/Aliyun-ECS-Windows-deployment.md` for the full flow.
+
 ## Current MVP Status
 - [x] PRD and delivery plan
 - [x] Frontend pages: chat / reminder / logs / family dashboard / emergency detail
 - [x] Backend APIs: chat, risk detection, reminders, emergencies, family summary, timeline
 - [x] Docker deployment: frontend + backend + nginx gateway
 - [x] Cloudflare named tunnel deployment template
-
