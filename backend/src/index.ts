@@ -1,4 +1,5 @@
-﻿import fs from "node:fs";
+﻿import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
@@ -49,6 +50,11 @@ interface VoiceCapabilities {
   note: string;
 }
 
+interface AliyunTokenState {
+  value: string;
+  expireTime: number;
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -63,7 +69,13 @@ const OPENAI_TRANSCRIPTION_MODEL =
   process.env.OPENAI_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-mini-transcribe";
 const ALIYUN_NLS_APPKEY = process.env.ALIYUN_NLS_APPKEY?.trim() ?? "";
 const ALIYUN_NLS_TOKEN = process.env.ALIYUN_NLS_TOKEN?.trim() ?? "";
+const ALIYUN_AK_ID =
+  process.env.ALIYUN_AK_ID?.trim() ?? process.env.ALIYUN_ACCESS_KEY_ID?.trim() ?? "";
+const ALIYUN_AK_SECRET =
+  process.env.ALIYUN_AK_SECRET?.trim() ?? process.env.ALIYUN_ACCESS_KEY_SECRET?.trim() ?? "";
 const ALIYUN_NLS_REGION = process.env.ALIYUN_NLS_REGION?.trim() || "cn-shanghai";
+const hasAliyunAutoToken = Boolean(ALIYUN_NLS_APPKEY && ALIYUN_AK_ID && ALIYUN_AK_SECRET);
+const ALIYUN_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const voiceCapabilities = resolveVoiceCapabilities();
 const messages: ChatMessage[] = [];
 const reminders: Reminder[] = [];
@@ -72,6 +84,14 @@ const emergencies: EmergencyEvent[] = [];
 let messageId = 1;
 let reminderId = 1;
 let emergencyId = 1;
+let aliyunTokenState: AliyunTokenState | null =
+  !hasAliyunAutoToken && ALIYUN_NLS_TOKEN
+    ? {
+        value: ALIYUN_NLS_TOKEN,
+        expireTime: Number.MAX_SAFE_INTEGER
+      }
+    : null;
+let aliyunTokenRefreshPromise: Promise<AliyunTokenState> | null = null;
 
 const riskKeywordFragments = [
   "胸痛",
@@ -103,11 +123,13 @@ const riskPatterns: RegExp[] = [
 ];
 
 function resolveVoiceCapabilities(): VoiceCapabilities {
-  if (ALIYUN_NLS_APPKEY && ALIYUN_NLS_TOKEN) {
+  if (ALIYUN_NLS_APPKEY && (hasAliyunAutoToken || ALIYUN_NLS_TOKEN)) {
     return {
       enabled: true,
       provider: "aliyun-nls",
-      note: "按住说话，松开后上传到服务器识别。当前使用阿里云语音识别。"
+      note: hasAliyunAutoToken
+        ? "按住说话，松开后上传到服务器识别。当前使用阿里云语音识别，Token 会在服务端自动刷新。"
+        : "按住说话，松开后上传到服务器识别。当前使用阿里云语音识别。"
     };
   }
 
@@ -124,6 +146,96 @@ function resolveVoiceCapabilities(): VoiceCapabilities {
     provider: "disabled",
     note: "服务器还没有配置服务端语音识别，请先用打字。"
   };
+}
+
+function aliyunPercentEncode(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => {
+    return `%${char.charCodeAt(0).toString(16).toUpperCase()}`;
+  });
+}
+
+function buildAliyunCanonicalQuery(parameters: Record<string, string>): string {
+  return Object.keys(parameters)
+    .sort()
+    .map((key) => `${aliyunPercentEncode(key)}=${aliyunPercentEncode(parameters[key] ?? "")}`)
+    .join("&");
+}
+
+async function readResponseJson<T>(response: globalThis.Response): Promise<T> {
+  const text = await response.text();
+  return JSON.parse(text) as T;
+}
+
+async function requestAliyunAccessToken(): Promise<AliyunTokenState> {
+  const parameters: Record<string, string> = {
+    AccessKeyId: ALIYUN_AK_ID,
+    Action: "CreateToken",
+    Format: "JSON",
+    RegionId: ALIYUN_NLS_REGION,
+    SignatureMethod: "HMAC-SHA1",
+    SignatureNonce: crypto.randomUUID(),
+    SignatureVersion: "1.0",
+    Timestamp: new Date().toISOString(),
+    Version: "2019-02-28"
+  };
+  const canonicalQuery = buildAliyunCanonicalQuery(parameters);
+  const stringToSign = `GET&${aliyunPercentEncode("/")}&${aliyunPercentEncode(canonicalQuery)}`;
+  const signature = crypto
+    .createHmac("sha1", `${ALIYUN_AK_SECRET}&`)
+    .update(stringToSign)
+    .digest("base64");
+  const requestUrl =
+    `https://nls-meta.${ALIYUN_NLS_REGION}.aliyuncs.com/?Signature=` +
+    `${aliyunPercentEncode(signature)}&${canonicalQuery}`;
+  const response = await fetch(requestUrl);
+  const data = await readResponseJson<{
+    Token?: { Id?: string; ExpireTime?: number };
+    Message?: string;
+    Code?: string;
+  }>(response);
+
+  if (!response.ok || !data.Token?.Id || !data.Token.ExpireTime) {
+    throw new Error(data.Message || data.Code || `阿里云 Token 获取失败（${response.status}）`);
+  }
+
+  return {
+    value: data.Token.Id,
+    expireTime: Number(data.Token.ExpireTime) * 1000
+  };
+}
+
+function isAliyunTokenFresh(tokenState: AliyunTokenState | null): boolean {
+  if (!tokenState) {
+    return false;
+  }
+
+  return tokenState.expireTime - Date.now() > ALIYUN_TOKEN_REFRESH_BUFFER_MS;
+}
+
+async function getAliyunNlsToken(): Promise<string> {
+  if (hasAliyunAutoToken) {
+    const currentTokenState = aliyunTokenState;
+    if (currentTokenState && isAliyunTokenFresh(currentTokenState)) {
+      return currentTokenState.value;
+    }
+
+    if (!aliyunTokenRefreshPromise) {
+      aliyunTokenRefreshPromise = requestAliyunAccessToken();
+    }
+
+    try {
+      aliyunTokenState = await aliyunTokenRefreshPromise;
+      return aliyunTokenState.value;
+    } finally {
+      aliyunTokenRefreshPromise = null;
+    }
+  }
+
+  if (aliyunTokenState?.value) {
+    return aliyunTokenState.value;
+  }
+
+  throw new Error("阿里云语音识别未配置可用的 Token 或 AccessKey。");
 }
 
 function detectRisk(text: string): boolean {
@@ -276,12 +388,8 @@ function buildFamilyTimeline(): FamilyTimelineItem[] {
   );
 }
 
-async function readResponseJson<T>(response: globalThis.Response): Promise<T> {
-  const text = await response.text();
-  return JSON.parse(text) as T;
-}
-
 async function transcribeWithAliyunNls(audioBuffer: Buffer): Promise<string> {
+  const token = await getAliyunNlsToken();
   const url = new URL(`https://nls-gateway-${ALIYUN_NLS_REGION}.aliyuncs.com/stream/v1/asr`);
   url.searchParams.set("appkey", ALIYUN_NLS_APPKEY);
   url.searchParams.set("format", "wav");
@@ -293,7 +401,7 @@ async function transcribeWithAliyunNls(audioBuffer: Buffer): Promise<string> {
   const response = await fetch(url, {
     method: "POST",
     headers: {
-      "X-NLS-Token": ALIYUN_NLS_TOKEN,
+      "X-NLS-Token": token,
       "Content-Type": "application/octet-stream",
       "Content-Length": String(audioBuffer.byteLength)
     },
@@ -457,12 +565,7 @@ app.patch("/api/reminders/:id/ack", (req: Request, res: Response) => {
     return;
   }
 
-  if (![
-    "pending",
-    "done",
-    "snooze",
-    "skip"
-  ].includes(action)) {
+  if (!["pending", "done", "snooze", "skip"].includes(action)) {
     res.status(400).json({ error: "invalid action" });
     return;
   }
@@ -541,7 +644,7 @@ if (hasFrontendBuild) {
 app.listen(PORT, () => {
   console.log(`backend started on :${PORT}`);
   console.log(`voice transcription provider: ${voiceCapabilities.provider}`);
+  if (voiceCapabilities.provider === "aliyun-nls" && hasAliyunAutoToken) {
+    console.log("aliyun nls token mode: auto-refresh via AccessKey");
+  }
 });
-
-
-

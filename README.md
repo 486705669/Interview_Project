@@ -78,8 +78,17 @@ For a Windows ECS host, create `deploy/windows/backend.env` from `deploy/windows
 
 ```text
 ALIYUN_NLS_APPKEY=your_appkey
-ALIYUN_NLS_TOKEN=your_token
+ALIYUN_AK_ID=your_access_key_id
+ALIYUN_AK_SECRET=your_access_key_secret
 ALIYUN_NLS_REGION=cn-shanghai
+```
+
+If you do not want to manage temporary NLS tokens manually, this setup will request `CreateToken` from Aliyun automatically and refresh it before expiry.
+
+Optional fallback:
+
+```text
+ALIYUN_NLS_TOKEN=your_temporary_token
 ```
 
 or
