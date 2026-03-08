@@ -66,6 +66,9 @@ const newReminderTitle = ref("");
 const newReminderTime = ref("");
 
 let recognition: SpeechRecognition | null = null;
+let recognitionStarting = false;
+let stopRequested = false;
+let receivedResult = false;
 
 const isSecureOrigin = computed(() => {
   return (
@@ -88,12 +91,12 @@ const voiceTip = computed(() => {
     return voiceStatus.value;
   }
   if (!canUseSpeechRecognition.value) {
-    return "当前浏览器不支持语音识别，请改用文字输入。建议 Android Chrome。";
+    return "当前浏览器不支持语音识别。优先使用系统浏览器中的 Android Chrome。";
   }
   if (!isSecureOrigin.value) {
-    return "当前是非 HTTPS 页面，部分手机浏览器会阻止麦克风。";
+    return "当前不是 HTTPS 页面，很多手机浏览器会直接禁用语音识别。";
   }
-  return "点击“按下开始语音”后说话，再点一次结束。";
+  return "点击后直接说话。若在微信或 QQ 内打开，请改用系统浏览器。";
 });
 
 function formatTime(value: string): string {
@@ -114,108 +117,174 @@ function speak(text: string): void {
   window.speechSynthesis.speak(utterance);
 }
 
-function createRecognition(): SpeechRecognition | null {
-  if (recognition) {
-    return recognition;
+function clearRecognition(): void {
+  if (!recognition) {
+    return;
   }
+
+  recognition.onstart = null;
+  recognition.onresult = null;
+  recognition.onerror = null;
+  recognition.onend = null;
+  recognition = null;
+}
+
+function getRecognitionConstructor():
+  | (new () => SpeechRecognition)
+  | null {
   const withKit = window as unknown as {
     webkitSpeechRecognition?: new () => SpeechRecognition;
   };
-  const SpeechRecognitionCtor =
-    window.SpeechRecognition || withKit.webkitSpeechRecognition;
-  if (!SpeechRecognitionCtor) {
+
+  return window.SpeechRecognition || withKit.webkitSpeechRecognition || null;
+}
+
+async function ensurePermissionNotDenied(): Promise<boolean> {
+  if (!navigator.permissions?.query) {
+    return true;
+  }
+
+  try {
+    const result = await navigator.permissions.query({
+      name: "microphone" as PermissionName
+    });
+
+    if (result.state === "denied") {
+      voiceStatus.value = "麦克风权限已被拒绝，请在浏览器站点设置中改为允许。";
+      return false;
+    }
+  } catch {
+    // Ignore browsers that do not support microphone permission query.
+  }
+
+  return true;
+}
+
+function createRecognitionSession(): SpeechRecognition | null {
+  const RecognitionCtor = getRecognitionConstructor();
+  if (!RecognitionCtor) {
     return null;
   }
 
-  const rec = new SpeechRecognitionCtor();
-  rec.lang = "zh-CN";
-  rec.interimResults = false;
-  rec.maxAlternatives = 1;
-  rec.onstart = () => {
+  const session = new RecognitionCtor();
+  session.lang = "zh-CN";
+  session.interimResults = false;
+  session.maxAlternatives = 1;
+  session.continuous = false;
+
+  session.onstart = () => {
+    recognitionStarting = false;
     listening.value = true;
-    voiceStatus.value = "正在听，请开始说话。";
+    receivedResult = false;
+    voiceStatus.value = "正在听，请直接说话。";
   };
-  rec.onresult = (event: SpeechRecognitionEvent) => {
+
+  session.onresult = (event: SpeechRecognitionEvent) => {
     const transcript = event.results?.[0]?.[0]?.transcript?.trim() ?? "";
+    receivedResult = transcript.length > 0;
+
     if (!transcript) {
-      voiceStatus.value = "没有识别到语音，请重试。";
+      voiceStatus.value = "没有识别到内容，请再说一次。";
       return;
     }
+
     chatInput.value = transcript;
     voiceStatus.value = `已识别：${transcript}`;
     void sendMessage();
   };
-  rec.onerror = (event: SpeechRecognitionErrorEvent) => {
+
+  session.onerror = (event: SpeechRecognitionErrorEvent) => {
     listening.value = false;
+    recognitionStarting = false;
+
+    if (event.error === "aborted") {
+      voiceStatus.value = stopRequested
+        ? "已停止录音。"
+        : "浏览器中断了本次语音识别。请再点一次重试；如果还失败，请改用系统浏览器或直接打字。";
+      return;
+    }
+
     if (event.error === "not-allowed") {
-      voiceStatus.value = "麦克风权限被拒绝，请在浏览器设置中允许麦克风。";
+      voiceStatus.value = "麦克风权限未允许，请到浏览器设置里开启麦克风。";
       return;
     }
+
     if (event.error === "no-speech") {
-      voiceStatus.value = "未检测到语音输入，请靠近麦克风再试一次。";
+      voiceStatus.value = "没有听到声音，请靠近麦克风后再试一次。";
       return;
     }
+
+    if (event.error === "audio-capture") {
+      voiceStatus.value = "浏览器没有拿到麦克风输入，请确认系统麦克风可用。";
+      return;
+    }
+
     if (event.error === "network") {
-      voiceStatus.value = "语音识别网络异常，请检查网络后重试。";
+      voiceStatus.value = "语音识别网络异常，请稍后重试。";
       return;
     }
+
     voiceStatus.value = `语音识别失败：${event.error}`;
   };
-  rec.onend = () => {
+
+  session.onend = () => {
     listening.value = false;
+    recognitionStarting = false;
+
+    if (!stopRequested && !receivedResult && !voiceStatus.value.startsWith("语音识别失败")) {
+      if (voiceStatus.value === "正在听，请直接说话。") {
+        voiceStatus.value = "录音结束，但没有识别到内容，请再试一次。";
+      }
+    }
+
+    stopRequested = false;
+    clearRecognition();
   };
-  recognition = rec;
-  return recognition;
-}
 
-async function ensureMicPermission(): Promise<boolean> {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    voiceStatus.value = "浏览器未提供麦克风权限接口，请使用 HTTPS 或系统浏览器。";
-    return false;
-  }
-
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((track) => track.stop());
-    return true;
-  } catch (_error) {
-    voiceStatus.value = "无法获取麦克风权限，请检查浏览器权限设置。";
-    return false;
-  }
+  return session;
 }
 
 async function toggleListening(): Promise<void> {
   if (!canUseSpeechRecognition.value) {
-    voiceStatus.value = "当前浏览器不支持语音识别。";
+    voiceStatus.value = "当前浏览器不支持语音识别，请改用文字输入。";
     return;
   }
 
   if (!isSecureOrigin.value) {
-    voiceStatus.value = "建议改为 HTTPS 访问，否则部分手机会禁用麦克风。";
-  }
-
-  const rec = createRecognition();
-  if (!rec) {
-    voiceStatus.value = "语音引擎初始化失败。";
+    voiceStatus.value = "当前不是 HTTPS 页面，语音识别大概率会被手机浏览器拦截。";
     return;
   }
 
-  if (listening.value) {
-    rec.stop();
-    listening.value = false;
-    voiceStatus.value = "已停止录音。";
+  if (recognitionStarting || listening.value) {
+    stopRequested = true;
+    recognition?.stop();
+    voiceStatus.value = "正在结束录音...";
     return;
   }
 
-  const permissionOk = await ensureMicPermission();
+  const permissionOk = await ensurePermissionNotDenied();
   if (!permissionOk) {
     return;
   }
 
+  clearRecognition();
+  recognition = createRecognitionSession();
+  if (!recognition) {
+    voiceStatus.value = "当前浏览器没有可用的语音识别能力。";
+    return;
+  }
+
+  stopRequested = false;
+  receivedResult = false;
+  recognitionStarting = true;
+  voiceStatus.value = "准备开始语音...";
+
   try {
-    rec.start();
-  } catch (_error) {
-    voiceStatus.value = "语音启动失败，请刷新页面重试。";
+    recognition.start();
+  } catch {
+    recognitionStarting = false;
+    clearRecognition();
+    voiceStatus.value = "语音启动失败，请刷新页面后再试。";
   }
 }
 
@@ -299,6 +368,7 @@ async function sendMessage(): Promise<void> {
     }
 
     const data = (await response.json()) as { reply: string; risk: boolean };
+
     messages.value.push({
       id: optimisticId + 1,
       role: "assistant",
@@ -314,7 +384,7 @@ async function sendMessage(): Promise<void> {
 
     speak(data.reply);
     await refreshAll();
-  } catch (_error) {
+  } catch {
     messages.value.push({
       id: optimisticId + 2,
       role: "assistant",
@@ -332,11 +402,13 @@ async function createReminder(): Promise<void> {
   if (!title || !time) {
     return;
   }
+
   await fetch(`${apiBase}/reminders`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title, time })
   });
+
   newReminderTitle.value = "";
   newReminderTime.value = "";
   await refreshAll();
@@ -348,6 +420,7 @@ async function ackReminder(id: number, action: ReminderStatus): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action })
   });
+
   await refreshAll();
 }
 
@@ -357,6 +430,7 @@ async function triggerManualEmergency(): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ triggerText: "用户手动点击紧急求助" })
   });
+
   emergencyMode.value = true;
   activeTab.value = "chat";
   speak("已进入紧急模式，请优先拨打120或联系家属。");
@@ -368,6 +442,7 @@ async function openEmergencyDetail(id: number): Promise<void> {
   if (!response.ok) {
     return;
   }
+
   const data = (await response.json()) as { item: EmergencyEvent };
   selectedEvent.value = data.item;
   activeTab.value = "eventDetail";
@@ -377,11 +452,13 @@ async function resolveSelectedEmergency(): Promise<void> {
   if (!selectedEvent.value) {
     return;
   }
+
   await fetch(`${apiBase}/emergencies/${selectedEvent.value.id}/resolve`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ actionText: "家属/后台确认已处理" })
   });
+
   await openEmergencyDetail(selectedEvent.value.id);
   await refreshAll();
 }
@@ -450,6 +527,7 @@ onMounted(async () => {
           <time>{{ formatTime(item.createdAt) }}</time>
         </li>
       </ul>
+
       <form class="composer" @submit.prevent="sendMessage">
         <input
           v-model="chatInput"
@@ -461,24 +539,28 @@ onMounted(async () => {
           {{ loading ? "处理中..." : "发送" }}
         </button>
       </form>
+
       <button
         class="voice"
         type="button"
         :disabled="voiceButtonDisabled"
         @click="toggleListening"
       >
-        {{ listening ? "停止说话" : "按下开始语音" }}
+        {{ listening ? "停止录音" : "按下开始语音" }}
       </button>
+
       <p class="tips">{{ voiceTip }}</p>
     </section>
 
     <section v-if="activeTab === 'reminder'" class="panel">
       <h2>提醒管理</h2>
+
       <form class="reminder-form" @submit.prevent="createReminder">
         <input v-model="newReminderTitle" type="text" placeholder="提醒内容（如：吃药）" />
         <input v-model="newReminderTime" type="datetime-local" />
         <button type="submit">新增提醒</button>
       </form>
+
       <ul class="list">
         <li v-for="item in reminders" :key="item.id" class="list-item">
           <div>
@@ -497,6 +579,7 @@ onMounted(async () => {
       <div class="topbar">
         <h2>应急记录</h2>
       </div>
+
       <ul class="list">
         <li v-for="item in emergencies" :key="item.id" class="list-item">
           <div>
@@ -565,12 +648,14 @@ onMounted(async () => {
         <p><strong>触发语句：</strong>{{ selectedEvent.triggerText }}</p>
         <p><strong>创建时间：</strong>{{ formatTime(selectedEvent.createdAt) }}</p>
         <p><strong>当前状态：</strong>{{ selectedEvent.status }}</p>
+
         <h3>处置动作日志</h3>
         <ul class="list">
           <li v-for="(action, index) in selectedEvent.actionLog" :key="index" class="list-item">
             {{ action }}
           </li>
         </ul>
+
         <button
           type="button"
           class="primary"
@@ -583,4 +668,3 @@ onMounted(async () => {
     </section>
   </main>
 </template>
-
