@@ -12,6 +12,7 @@ This repository contains a 3-day MVP for a mobile web product:
 - `docs/三天落地执行方案.md`
 - `docs/Cloudflare-named-tunnel部署.md`
 - `docs/Aliyun-ECS-Windows-deployment.md`
+- `docs/Aliyun-ECS-Windows-domain-deployment.md`
 
 ## Project Structure
 ```text
@@ -64,6 +65,11 @@ See `docs/Cloudflare-named-tunnel部署.md` for the full flow.
 For a Windows ECS host, use the Windows scripts in `deploy/windows/` and point the Cloudflare named tunnel to `http://localhost:3000`.
 
 See `docs/Aliyun-ECS-Windows-deployment.md` for the full flow.
+
+## Aliyun ECS With Domain
+If you want to bind a real domain directly to the Windows ECS host, use Caddy as the HTTPS reverse proxy.
+
+See `docs/Aliyun-ECS-Windows-domain-deployment.md` for the full flow.
 
 ## Current MVP Status
 - [x] PRD and delivery plan
