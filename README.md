@@ -71,6 +71,24 @@ If you want to bind a real domain directly to the Windows ECS host, use Caddy as
 
 See `docs/Aliyun-ECS-Windows-domain-deployment.md` for the full flow.
 
+## Server-Side Voice Recognition
+The mobile web now uses `press-and-hold to record -> upload WAV -> server-side transcription`.
+
+For a Windows ECS host, create `deploy/windows/backend.env` from `deploy/windows/backend.env.example` and choose one provider:
+
+```text
+ALIYUN_NLS_APPKEY=your_appkey
+ALIYUN_NLS_TOKEN=your_token
+ALIYUN_NLS_REGION=cn-shanghai
+```
+
+or
+
+```text
+OPENAI_API_KEY=your_api_key
+OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+```
+
 ## Current MVP Status
 - [x] PRD and delivery plan
 - [x] Frontend pages: chat / reminder / logs / family dashboard / emergency detail

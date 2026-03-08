@@ -1,8 +1,11 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 
 type Tab = "chat" | "reminder" | "logs" | "family" | "eventDetail";
 type ReminderStatus = "pending" | "done" | "snooze" | "skip";
+type VoiceProvider = "aliyun-nls" | "openai" | "disabled";
+
+type AudioContextConstructor = new () => AudioContext;
 
 interface ChatMessage {
   id: number;
@@ -43,14 +46,28 @@ interface TimelineItem {
   level: "normal" | "warning";
 }
 
+interface VoiceCapabilities {
+  enabled: boolean;
+  provider: VoiceProvider;
+  note: string;
+}
+
+interface RecorderNodes {
+  stream: MediaStream;
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  sink: GainNode;
+}
+
 const apiBase = import.meta.env.VITE_API_BASE ?? "/api";
 const activeTab = ref<Tab>("chat");
-const listening = ref(false);
 const loading = ref(false);
+const recording = ref(false);
+const uploadingAudio = ref(false);
 const emergencyMode = ref(false);
 const chatInput = ref("");
 const voiceStatus = ref("");
-
 const reminders = ref<Reminder[]>([]);
 const messages = ref<ChatMessage[]>([]);
 const emergencies = ref<EmergencyEvent[]>([]);
@@ -62,15 +79,19 @@ const familySummary = ref<FamilySummary>({
 });
 const familyTimeline = ref<TimelineItem[]>([]);
 const selectedEvent = ref<EmergencyEvent | null>(null);
-
+const voiceCapabilities = ref<VoiceCapabilities>({
+  enabled: false,
+  provider: "disabled",
+  note: "服务器还没有配置服务端语音识别，请先用打字。"
+});
 const newReminderTitle = ref("");
 const newReminderTime = ref("");
 
-let recognition: SpeechRecognition | null = null;
-let recognitionStarting = false;
-let stopRequested = false;
-let receivedResult = false;
 let reminderTimer: number | null = null;
+let recorderNodes: RecorderNodes | null = null;
+let pcmChunks: Float32Array[] = [];
+let inputSampleRate = 44100;
+let recordingStartedAt = 0;
 const notifiedReminderKeys = new Set<string>();
 
 const isSecureOrigin = computed(() => {
@@ -80,34 +101,67 @@ const isSecureOrigin = computed(() => {
   );
 });
 
-const canUseSpeechRecognition = computed(() => {
-  const withKit = window as unknown as { webkitSpeechRecognition?: unknown };
-  return Boolean(window.SpeechRecognition || withKit.webkitSpeechRecognition);
-});
-
-const isEdgeMobile = computed(() => {
-  return /EdgA|EdgiOS/i.test(window.navigator.userAgent);
+const hasRecorderSupport = computed(() => {
+  return Boolean(navigator.mediaDevices?.getUserMedia && getAudioContextConstructor());
 });
 
 const voiceButtonDisabled = computed(() => {
-  return !canUseSpeechRecognition.value;
+  return (
+    !isSecureOrigin.value ||
+    !hasRecorderSupport.value ||
+    !voiceCapabilities.value.enabled ||
+    loading.value ||
+    uploadingAudio.value
+  );
+});
+
+const voiceButtonLabel = computed(() => {
+  if (uploadingAudio.value) {
+    return "识别中...";
+  }
+
+  return recording.value ? "松开发送" : "按住说话";
 });
 
 const voiceTip = computed(() => {
   if (voiceStatus.value) {
     return voiceStatus.value;
   }
-  if (!canUseSpeechRecognition.value) {
-    return "当前浏览器不支持语音识别。优先使用系统浏览器中的 Android Chrome。";
-  }
-  if (isEdgeMobile.value) {
-    return "当前是 Edge 手机浏览器。它经常拿到麦克风权限后仍中断语音识别，优先改用系统 Chrome。";
-  }
+
   if (!isSecureOrigin.value) {
-    return "当前不是 HTTPS 页面，很多手机浏览器会直接禁用语音识别。";
+    return "当前不是 HTTPS 页面，浏览器不会开放麦克风。";
   }
-  return "点击后直接说话。若在微信或 QQ 内打开，请改用系统浏览器。";
+
+  if (!hasRecorderSupport.value) {
+    return "当前浏览器不支持录音，请改用系统浏览器。";
+  }
+
+  if (!voiceCapabilities.value.enabled) {
+    return voiceCapabilities.value.note;
+  }
+
+  return voiceCapabilities.value.note;
 });
+
+const voiceProviderLabel = computed(() => {
+  if (voiceCapabilities.value.provider === "aliyun-nls") {
+    return "阿里云服务端语音识别";
+  }
+
+  if (voiceCapabilities.value.provider === "openai") {
+    return "OpenAI 服务端语音识别";
+  }
+
+  return "未配置";
+});
+
+function getAudioContextConstructor(): AudioContextConstructor | null {
+  const withKit = window as typeof window & {
+    webkitAudioContext?: AudioContextConstructor;
+  };
+
+  return window.AudioContext || withKit.webkitAudioContext || null;
+}
 
 function formatTime(value: string): string {
   const date = new Date(value);
@@ -125,28 +179,6 @@ function speak(text: string): void {
   utterance.lang = "zh-CN";
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
-}
-
-function clearRecognition(): void {
-  if (!recognition) {
-    return;
-  }
-
-  recognition.onstart = null;
-  recognition.onresult = null;
-  recognition.onerror = null;
-  recognition.onend = null;
-  recognition = null;
-}
-
-function getRecognitionConstructor():
-  | (new () => SpeechRecognition)
-  | null {
-  const withKit = window as unknown as {
-    webkitSpeechRecognition?: new () => SpeechRecognition;
-  };
-
-  return window.SpeechRecognition || withKit.webkitSpeechRecognition || null;
 }
 
 async function ensurePermissionNotDenied(): Promise<boolean> {
@@ -170,133 +202,187 @@ async function ensurePermissionNotDenied(): Promise<boolean> {
   return true;
 }
 
-function createRecognitionSession(): SpeechRecognition | null {
-  const RecognitionCtor = getRecognitionConstructor();
-  if (!RecognitionCtor) {
-    return null;
-  }
-
-  const session = new RecognitionCtor();
-  session.lang = "zh-CN";
-  session.interimResults = false;
-  session.maxAlternatives = 1;
-  session.continuous = false;
-
-  session.onstart = () => {
-    recognitionStarting = false;
-    listening.value = true;
-    receivedResult = false;
-    voiceStatus.value = "正在听，请直接说话。";
-  };
-
-  session.onresult = (event: SpeechRecognitionEvent) => {
-    const transcript = event.results?.[0]?.[0]?.transcript?.trim() ?? "";
-    receivedResult = transcript.length > 0;
-
-    if (!transcript) {
-      voiceStatus.value = "没有识别到内容，请再说一次。";
-      return;
-    }
-
-    chatInput.value = transcript;
-    voiceStatus.value = `已识别：${transcript}`;
-    void sendMessage();
-  };
-
-  session.onerror = (event: SpeechRecognitionErrorEvent) => {
-    listening.value = false;
-    recognitionStarting = false;
-
-    if (event.error === "aborted") {
-      voiceStatus.value = stopRequested
-        ? "已停止录音。"
-        : isEdgeMobile.value
-          ? "Edge 手机浏览器中断了本次语音识别。即使麦克风权限已允许，它也可能直接终止识别。请优先改用系统 Chrome 或直接打字。"
-          : "浏览器中断了本次语音识别。请再点一次重试；如果还失败，请改用系统浏览器或直接打字。";
-      return;
-    }
-
-    if (event.error === "not-allowed") {
-      voiceStatus.value = "麦克风权限未允许，请到浏览器设置里开启麦克风。";
-      return;
-    }
-
-    if (event.error === "no-speech") {
-      voiceStatus.value = "没有听到声音，请靠近麦克风后再试一次。";
-      return;
-    }
-
-    if (event.error === "audio-capture") {
-      voiceStatus.value = "浏览器没有拿到麦克风输入，请确认系统麦克风可用。";
-      return;
-    }
-
-    if (event.error === "network") {
-      voiceStatus.value = "语音识别网络异常，请稍后重试。";
-      return;
-    }
-
-    voiceStatus.value = `语音识别失败：${event.error}`;
-  };
-
-  session.onend = () => {
-    listening.value = false;
-    recognitionStarting = false;
-
-    if (!stopRequested && !receivedResult && !voiceStatus.value.startsWith("语音识别失败")) {
-      if (voiceStatus.value === "正在听，请直接说话。") {
-        voiceStatus.value = "录音结束，但没有识别到内容，请再试一次。";
-      }
-    }
-
-    stopRequested = false;
-    clearRecognition();
-  };
-
-  return session;
+function buildReminderKey(reminder: Reminder): string {
+  return `${reminder.id}:${reminder.time}`;
 }
 
-async function toggleListening(): Promise<void> {
-  if (!canUseSpeechRecognition.value) {
-    voiceStatus.value = "当前浏览器不支持语音识别，请改用文字输入。";
+function checkDueReminders(): void {
+  const now = Date.now();
+  const dueReminder = reminders.value.find((item) => {
+    if (item.status !== "pending") {
+      return false;
+    }
+
+    const dueAt = new Date(item.time).getTime();
+    if (Number.isNaN(dueAt)) {
+      return false;
+    }
+
+    return dueAt <= now;
+  });
+
+  if (!dueReminder) {
     return;
   }
 
-  if (!isSecureOrigin.value) {
-    voiceStatus.value = "当前不是 HTTPS 页面，语音识别大概率会被手机浏览器拦截。";
+  const reminderKey = buildReminderKey(dueReminder);
+  if (notifiedReminderKeys.has(reminderKey)) {
     return;
   }
 
-  if (recognitionStarting || listening.value) {
-    stopRequested = true;
-    recognition?.stop();
-    voiceStatus.value = "正在结束录音...";
+  notifiedReminderKeys.add(reminderKey);
+  activeDueReminder.value = dueReminder;
+  speak(`提醒您：${dueReminder.title}`);
+
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("老人陪伴助手提醒", {
+      body: dueReminder.title
+    });
+  }
+}
+
+function registerGlobalReleaseListeners(): void {
+  window.addEventListener("pointerup", handleGlobalPointerUp);
+  window.addEventListener("pointercancel", handleGlobalPointerCancel);
+  window.addEventListener("blur", handleGlobalPointerCancel);
+}
+
+function unregisterGlobalReleaseListeners(): void {
+  window.removeEventListener("pointerup", handleGlobalPointerUp);
+  window.removeEventListener("pointercancel", handleGlobalPointerCancel);
+  window.removeEventListener("blur", handleGlobalPointerCancel);
+}
+
+function handleGlobalPointerUp(): void {
+  if (recording.value) {
+    void stopPressRecording(false);
+  }
+}
+
+function handleGlobalPointerCancel(): void {
+  if (recording.value) {
+    void stopPressRecording(true);
+  }
+}
+
+async function cleanupRecorder(): Promise<void> {
+  unregisterGlobalReleaseListeners();
+
+  if (!recorderNodes) {
     return;
   }
 
-  const permissionOk = await ensurePermissionNotDenied();
-  if (!permissionOk) {
-    return;
+  recorderNodes.processor.onaudioprocess = null;
+  recorderNodes.source.disconnect();
+  recorderNodes.processor.disconnect();
+  recorderNodes.sink.disconnect();
+  recorderNodes.stream.getTracks().forEach((track) => track.stop());
+
+  if (recorderNodes.context.state !== "closed") {
+    await recorderNodes.context.close().catch(() => undefined);
   }
 
-  clearRecognition();
-  recognition = createRecognitionSession();
-  if (!recognition) {
-    voiceStatus.value = "当前浏览器没有可用的语音识别能力。";
-    return;
+  recorderNodes = null;
+}
+
+function mergeAudioChunks(chunks: Float32Array[]): Float32Array {
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Float32Array(totalLength);
+
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
   }
 
-  stopRequested = false;
-  receivedResult = false;
-  recognitionStarting = true;
-  voiceStatus.value = "准备开始语音...";
+  return merged;
+}
 
+function floatTo16Bit(sample: number): number {
+  const clamped = Math.max(-1, Math.min(1, sample));
+  return clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+}
+
+function downsampleTo16k(buffer: Float32Array, sourceSampleRate: number): Int16Array {
+  if (sourceSampleRate === 16000) {
+    return Int16Array.from(buffer, (sample) => floatTo16Bit(sample));
+  }
+
+  const ratio = sourceSampleRate / 16000;
+  const resultLength = Math.round(buffer.length / ratio);
+  const result = new Int16Array(resultLength);
+
+  let offsetBuffer = 0;
+  for (let index = 0; index < resultLength; index += 1) {
+    const nextOffsetBuffer = Math.round((index + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+
+    for (let sourceIndex = offsetBuffer; sourceIndex < nextOffsetBuffer && sourceIndex < buffer.length; sourceIndex += 1) {
+      sum += buffer[sourceIndex] ?? 0;
+      count += 1;
+    }
+
+    const sample = count > 0 ? sum / count : 0;
+    result[index] = floatTo16Bit(sample);
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+}
+
+function writeAsciiString(view: DataView, offset: number, value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
+}
+
+function encodeWav(samples: Int16Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  writeAsciiString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeAsciiString(view, 8, "WAVE");
+  writeAsciiString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAsciiString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  for (let index = 0; index < samples.length; index += 1) {
+    view.setInt16(44 + index * 2, samples[index] ?? 0, true);
+  }
+
+  return buffer;
+}
+
+function buildWavBlob(chunks: Float32Array[], sourceSampleRate: number): Blob {
+  const merged = mergeAudioChunks(chunks);
+  const downsampled = downsampleTo16k(merged, sourceSampleRate);
+  const wavBuffer = encodeWav(downsampled, 16000);
+  return new Blob([wavBuffer], { type: "audio/wav" });
+}
+
+async function fetchVoiceCapabilities(): Promise<void> {
   try {
-    recognition.start();
+    const response = await fetch(`${apiBase}/voice/capabilities`);
+    if (!response.ok) {
+      throw new Error("voice capabilities failed");
+    }
+
+    voiceCapabilities.value = (await response.json()) as VoiceCapabilities;
   } catch {
-    recognitionStarting = false;
-    clearRecognition();
-    voiceStatus.value = "语音启动失败，请刷新页面后再试。";
+    voiceCapabilities.value = {
+      enabled: false,
+      provider: "disabled",
+      note: "暂时读不到服务器语音配置，请先用打字。"
+    };
   }
 }
 
@@ -350,45 +436,7 @@ async function refreshAll(): Promise<void> {
     fetchEmergencies(),
     fetchFamilyData()
   ]);
-}
-
-function buildReminderKey(reminder: Reminder): string {
-  return `${reminder.id}:${reminder.time}`;
-}
-
-function checkDueReminders(): void {
-  const now = Date.now();
-  const dueReminder = reminders.value.find((item) => {
-    if (item.status !== "pending") {
-      return false;
-    }
-
-    const dueAt = new Date(item.time).getTime();
-    if (Number.isNaN(dueAt)) {
-      return false;
-    }
-
-    return dueAt <= now;
-  });
-
-  if (!dueReminder) {
-    return;
-  }
-
-  const reminderKey = buildReminderKey(dueReminder);
-  if (notifiedReminderKeys.has(reminderKey)) {
-    return;
-  }
-
-  notifiedReminderKeys.add(reminderKey);
-  activeDueReminder.value = dueReminder;
-  speak(`提醒您：${dueReminder.title}`);
-
-  if ("Notification" in window && Notification.permission === "granted") {
-    new Notification("老人陪伴助手提醒", {
-      body: dueReminder.title
-    });
-  }
+  checkDueReminders();
 }
 
 async function sendMessage(): Promise<void> {
@@ -447,6 +495,149 @@ async function sendMessage(): Promise<void> {
   }
 }
 
+async function uploadRecording(audioBlob: Blob): Promise<void> {
+  uploadingAudio.value = true;
+  voiceStatus.value = "正在上传录音并识别...";
+
+  try {
+    const response = await fetch(`${apiBase}/voice/transcribe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "audio/wav"
+      },
+      body: audioBlob
+    });
+
+    const data = (await response.json()) as { text?: string; error?: string };
+    if (!response.ok || !data.text?.trim()) {
+      throw new Error(data.error || "服务器暂时无法识别语音");
+    }
+
+    chatInput.value = data.text.trim();
+    voiceStatus.value = `已识别：${chatInput.value}`;
+    await sendMessage();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "上传录音失败";
+    voiceStatus.value = `语音识别失败：${message}`;
+  } finally {
+    uploadingAudio.value = false;
+  }
+}
+
+async function startPressRecording(): Promise<void> {
+  if (recording.value || voiceButtonDisabled.value) {
+    return;
+  }
+
+  if (!isSecureOrigin.value) {
+    voiceStatus.value = "当前不是 HTTPS 页面，浏览器不会开放麦克风。";
+    return;
+  }
+
+  if (!hasRecorderSupport.value) {
+    voiceStatus.value = "当前浏览器不支持录音，请改用系统浏览器。";
+    return;
+  }
+
+  if (!voiceCapabilities.value.enabled) {
+    voiceStatus.value = voiceCapabilities.value.note;
+    return;
+  }
+
+  const permissionOk = await ensurePermissionNotDenied();
+  if (!permissionOk) {
+    return;
+  }
+
+  const AudioContextCtor = getAudioContextConstructor();
+  if (!AudioContextCtor) {
+    voiceStatus.value = "当前浏览器不支持录音。";
+    return;
+  }
+
+  try {
+    window.speechSynthesis?.cancel();
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+
+    const context = new AudioContextCtor();
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(4096, 1, 1);
+    const sink = context.createGain();
+    sink.gain.value = 0;
+
+    pcmChunks = [];
+    inputSampleRate = context.sampleRate;
+    recordingStartedAt = Date.now();
+
+    processor.onaudioprocess = (event: AudioProcessingEvent) => {
+      if (!recording.value) {
+        return;
+      }
+
+      const inputData = event.inputBuffer.getChannelData(0);
+      pcmChunks.push(new Float32Array(inputData));
+    };
+
+    source.connect(processor);
+    processor.connect(sink);
+    sink.connect(context.destination);
+
+    recorderNodes = {
+      stream,
+      context,
+      source,
+      processor,
+      sink
+    };
+
+    registerGlobalReleaseListeners();
+    recording.value = true;
+    voiceStatus.value = "正在录音，松开发送。";
+  } catch {
+    await cleanupRecorder();
+    voiceStatus.value = "打开麦克风失败，请检查系统和浏览器权限。";
+  }
+}
+
+async function stopPressRecording(cancelUpload: boolean): Promise<void> {
+  if (!recording.value) {
+    return;
+  }
+
+  recording.value = false;
+  const duration = Date.now() - recordingStartedAt;
+  const recordedChunks = pcmChunks;
+  const sourceSampleRate = inputSampleRate;
+  pcmChunks = [];
+
+  await cleanupRecorder();
+
+  if (cancelUpload) {
+    voiceStatus.value = "录音已取消。";
+    return;
+  }
+
+  if (duration < 400 || recordedChunks.length === 0) {
+    voiceStatus.value = "录音时间太短，请再按住说一句。";
+    return;
+  }
+
+  const audioBlob = buildWavBlob(recordedChunks, sourceSampleRate);
+  await uploadRecording(audioBlob);
+}
+
 async function createReminder(): Promise<void> {
   const title = newReminderTitle.value.trim();
   const time = newReminderTime.value.trim();
@@ -488,7 +679,7 @@ async function triggerManualEmergency(): Promise<void> {
 
   emergencyMode.value = true;
   activeTab.value = "chat";
-  speak("已进入紧急模式，请优先拨打120或联系家属。");
+  speak("已进入紧急模式，请优先拨打 120 或联系家属。");
   await refreshAll();
 }
 
@@ -519,7 +710,7 @@ async function resolveSelectedEmergency(): Promise<void> {
 }
 
 onMounted(async () => {
-  await refreshAll();
+  await Promise.all([refreshAll(), fetchVoiceCapabilities()]);
 
   if ("Notification" in window && Notification.permission === "default") {
     void Notification.requestPermission().catch(() => undefined);
@@ -534,6 +725,9 @@ onUnmounted(() => {
   if (reminderTimer !== null) {
     window.clearInterval(reminderTimer);
   }
+
+  unregisterGlobalReleaseListeners();
+  void cleanupRecorder();
 });
 </script>
 
@@ -560,7 +754,7 @@ onUnmounted(() => {
       <div class="due-actions">
         <button type="button" @click="ackReminder(activeDueReminder.id, 'done')">已完成</button>
         <button type="button" @click="ackReminder(activeDueReminder.id, 'snooze')">
-          10分钟后再提醒
+          10 分钟后再提醒
         </button>
       </div>
     </section>
@@ -622,14 +816,17 @@ onUnmounted(() => {
 
       <button
         class="voice"
+        :class="{ recording }"
         type="button"
         :disabled="voiceButtonDisabled"
-        @click="toggleListening"
+        @pointerdown.prevent="startPressRecording"
+        @contextmenu.prevent
       >
-        {{ listening ? "停止录音" : "按下开始语音" }}
+        {{ voiceButtonLabel }}
       </button>
 
       <p class="tips">{{ voiceTip }}</p>
+      <p class="voice-provider">当前识别：{{ voiceProviderLabel }}</p>
     </section>
 
     <section v-if="activeTab === 'reminder'" class="panel">
@@ -645,7 +842,7 @@ onUnmounted(() => {
         <li v-for="item in reminders" :key="item.id" class="list-item">
           <div>
             <strong>{{ item.title }}</strong>
-            <p>{{ formatTime(item.time) }} · {{ item.status }}</p>
+            <p>{{ formatTime(item.time) }} / {{ item.status }}</p>
           </div>
           <div class="actions">
             <button type="button" @click="ackReminder(item.id, 'done')">已完成</button>
@@ -664,7 +861,7 @@ onUnmounted(() => {
         <li v-for="item in emergencies" :key="item.id" class="list-item">
           <div>
             <strong>{{ item.triggerText }}</strong>
-            <p>{{ formatTime(item.createdAt) }} · {{ item.status }} · {{ item.source }}</p>
+            <p>{{ formatTime(item.createdAt) }} / {{ item.status }} / {{ item.source }}</p>
           </div>
           <div class="actions">
             <button type="button" @click="openEmergencyDetail(item.id)">查看详情</button>
@@ -705,7 +902,7 @@ onUnmounted(() => {
           <div>
             <strong>{{ item.title }}</strong>
             <p>{{ item.description }}</p>
-            <p>{{ formatTime(item.createdAt) }} · {{ item.type }}</p>
+            <p>{{ formatTime(item.createdAt) }} / {{ item.type }}</p>
           </div>
           <div v-if="item.type === 'emergency'" class="actions">
             <button type="button" @click="openEmergencyDetail(Number(item.id.split('-')[1]))">
@@ -723,7 +920,7 @@ onUnmounted(() => {
       </div>
 
       <div v-if="selectedEvent" class="detail-card">
-        <p><strong>事件ID：</strong>{{ selectedEvent.id }}</p>
+        <p><strong>事件 ID：</strong>{{ selectedEvent.id }}</p>
         <p><strong>触发来源：</strong>{{ selectedEvent.source }}</p>
         <p><strong>触发语句：</strong>{{ selectedEvent.triggerText }}</p>
         <p><strong>创建时间：</strong>{{ formatTime(selectedEvent.createdAt) }}</p>

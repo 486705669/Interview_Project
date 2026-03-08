@@ -1,4 +1,4 @@
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
@@ -8,6 +8,7 @@ type Role = "user" | "assistant";
 type ReminderStatus = "pending" | "done" | "snooze" | "skip";
 type EmergencySource = "keyword" | "manual";
 type EmergencyStatus = "open" | "resolved";
+type AsrProvider = "disabled" | "aliyun-nls" | "openai";
 
 interface ChatMessage {
   id: number;
@@ -42,6 +43,12 @@ interface FamilyTimelineItem {
   level: "normal" | "warning";
 }
 
+interface VoiceCapabilities {
+  enabled: boolean;
+  provider: AsrProvider;
+  note: string;
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -51,6 +58,13 @@ const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const frontendDistDir =
   process.env.FRONTEND_DIST_DIR ?? path.resolve(currentDir, "../../frontend/dist");
 const hasFrontendBuild = fs.existsSync(frontendDistDir);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() ?? "";
+const OPENAI_TRANSCRIPTION_MODEL =
+  process.env.OPENAI_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-mini-transcribe";
+const ALIYUN_NLS_APPKEY = process.env.ALIYUN_NLS_APPKEY?.trim() ?? "";
+const ALIYUN_NLS_TOKEN = process.env.ALIYUN_NLS_TOKEN?.trim() ?? "";
+const ALIYUN_NLS_REGION = process.env.ALIYUN_NLS_REGION?.trim() || "cn-shanghai";
+const voiceCapabilities = resolveVoiceCapabilities();
 const messages: ChatMessage[] = [];
 const reminders: Reminder[] = [];
 const emergencies: EmergencyEvent[] = [];
@@ -60,33 +74,57 @@ let reminderId = 1;
 let emergencyId = 1;
 
 const riskKeywordFragments = [
-  "\u80f8\u75db",
-  "\u80f8\u53e3\u75db",
-  "\u547c\u5438\u56f0\u96be",
-  "\u5598\u4e0d\u4e0a\u6c14",
-  "\u6655\u5012",
-  "\u660f\u8ff7",
-  "\u5267\u70c8\u5934\u75db",
-  "\u809a\u5b50\u75db\u5f97\u5389\u5bb3",
-  "\u5fc3\u614c",
+  "胸痛",
+  "胸口痛",
+  "呼吸困难",
+  "喘不上气",
+  "晕倒",
+  "昏迷",
+  "剧烈头痛",
+  "肚子痛得厉害",
+  "心慌",
   "chest pain",
   "shortness of breath",
   "fainted"
 ];
 
 const riskPatterns: RegExp[] = [
-  /\u80f8.*\u75db/u,
-  /\u80f8\u53e3.*\u75db/u,
-  /\u547c\u5438.*\u56f0\u96be/u,
-  /\u5598\u4e0d\u4e0a\u6c14/u,
-  /\u6655\u5012/u,
-  /\u660f\u8ff7/u,
-  /\u5934.*\u5267\u70c8.*\u75db/u,
-  /\u809a\u5b50.*\u75db.*\u5389\u5bb3/u,
-  /\u5fc3\u614c/u,
+  /胸.*痛/u,
+  /胸口.*痛/u,
+  /呼吸.*困难/u,
+  /喘不上气/u,
+  /晕倒/u,
+  /昏迷/u,
+  /头.*剧烈.*痛/u,
+  /肚子.*痛.*厉害/u,
+  /心慌/u,
   /chest\s*pain/i,
   /shortness\s*of\s*breath/i
 ];
+
+function resolveVoiceCapabilities(): VoiceCapabilities {
+  if (ALIYUN_NLS_APPKEY && ALIYUN_NLS_TOKEN) {
+    return {
+      enabled: true,
+      provider: "aliyun-nls",
+      note: "按住说话，松开后上传到服务器识别。当前使用阿里云语音识别。"
+    };
+  }
+
+  if (OPENAI_API_KEY) {
+    return {
+      enabled: true,
+      provider: "openai",
+      note: "按住说话，松开后上传到服务器识别。当前使用 OpenAI 语音识别。"
+    };
+  }
+
+  return {
+    enabled: false,
+    provider: "disabled",
+    note: "服务器还没有配置服务端语音识别，请先用打字。"
+  };
+}
 
 function detectRisk(text: string): boolean {
   const normalized = text.replace(/\s+/g, "").toLowerCase();
@@ -101,7 +139,7 @@ function includesAny(text: string, keywords: string[]): boolean {
 }
 
 function isQuestion(text: string): boolean {
-  return /[？?]$/.test(text) || /吗|什么|怎么|如何|为什么|几点|多少/.test(text);
+  return /[?？]$/.test(text) || /怎么|如何|为什么|几点|多少|在哪|什么/.test(text);
 }
 
 function extractTopic(text: string): string {
@@ -117,63 +155,69 @@ function buildReply(text: string, risk: boolean): string {
   const normalized = text.replace(/\s+/g, "").toLowerCase();
 
   if (risk) {
-    return "\u6211\u542c\u5230\u60a8\u53ef\u80fd\u6709\u7d27\u6025\u4e0d\u9002\u3002\u8bf7\u4f18\u5148\u62e8\u6253120\uff0c\u6216\u7acb\u5373\u8054\u7cfb\u7d27\u6025\u8054\u7cfb\u4eba\u3002\u5982\u679c\u60a8\u8fd8\u80fd\u8bf4\u8bdd\uff0c\u53ef\u4ee5\u544a\u8bc9\u6211\u73b0\u5728\u6700\u96be\u53d7\u7684\u611f\u89c9\u662f\u4ec0\u4e48\u3002";
+    return "我听到您可能有紧急不适。请优先拨打 120，或立即联系紧急联系人。如果您还能说话，可以告诉我现在最难受的感觉是什么。";
   }
 
   if (includesAny(normalized, ["你好", "您好", "在吗", "早上好", "晚上好"])) {
-    return "\u60a8\u597d\uff0c\u6211\u5728\u8fd9\u91cc\u3002\u60a8\u60f3\u804a\u804a\u5929\uff0c\u8bbe\u4e2a\u63d0\u9192\uff0c\u8fd8\u662f\u8bf4\u8bf4\u73b0\u5728\u8eab\u4f53\u6709\u54ea\u91cc\u4e0d\u8212\u670d\uff1f";
+    return "您好，我在这里。您想聊聊天、设个提醒，还是说说现在身体哪里不舒服？";
   }
 
   if (includesAny(normalized, ["你是谁", "你叫什么", "你是干嘛的"])) {
-    return "\u6211\u662f\u8001\u4eba\u966a\u4f34\u52a9\u624b\u3002\u6211\u73b0\u5728\u4e3b\u8981\u80fd\u966a\u60a8\u804a\u5929\uff0c\u5e2e\u60a8\u8bb0\u63d0\u9192\uff0c\u8bb0\u5f55\u5173\u952e\u60c5\u51b5\uff0c\u9047\u5230\u98ce\u9669\u65f6\u4f18\u5148\u5f15\u5bfc\u6c42\u52a9\u3002";
+    return "我是老人陪伴助手。我现在主要能陪您聊天、帮您记提醒、记录关键情况，遇到风险时优先引导求助。";
+  }
+
+  if (
+    includesAny(normalized, ["你会做什么", "你能做什么", "能帮我什么", "怎么用", "帮助", "功能"])
+  ) {
+    return "我现在最擅长四件事：陪您聊天、帮您设提醒、记录重要情况、遇到危险时引导您求助。您想先聊天，还是先设个提醒？";
+  }
+
+  if (includesAny(normalized, ["提醒", "吃药", "喝水", "复诊", "闹钟", "记得"])) {
+    return "可以。我能帮您记吃药、喝水、复诊这些提醒。您可以直接告诉我时间和事情，也可以去提醒页手动新增。";
+  }
+
+  if (includesAny(normalized, ["孤单", "孤独", "无聊", "难过", "烦", "陪我聊", "想聊天"])) {
+    return "听起来您现在需要有人陪您说说话。我在这里。您最想聊的是家里人、身体情况，还是今天发生的事？";
+  }
+
+  if (includesAny(normalized, ["谢谢", "麻烦你", "辛苦了"])) {
+    return "不客气。我会继续陪着您。您还想聊聊，还是需要我帮您设个提醒？";
+  }
+
+  if (includesAny(normalized, ["睡不着", "失眠", "睡不好"])) {
+    return "晚上睡不着会很难受。我不做医疗诊断，但您可以先试试放慢呼吸、喝点温水、少看刺激内容。如果您愿意，我可以先陪您聊一会儿。";
   }
 
   if (
     includesAny(normalized, [
-      "你会做什么",
-      "你能做什么",
-      "能帮我什么",
-      "怎么用",
-      "帮助",
-      "功能"
+      "头疼",
+      "头痛",
+      "肚子疼",
+      "胃不舒服",
+      "咳嗽",
+      "发烧",
+      "鼻塞",
+      "乏力",
+      "腿疼",
+      "腰酸"
     ])
   ) {
-    return "\u6211\u73b0\u5728\u6700\u64c5\u957f\u56db\u4ef6\u4e8b\uff1a\u966a\u60a8\u804a\u5929\uff0c\u5e2e\u60a8\u8bbe\u63d0\u9192\uff0c\u8bb0\u5f55\u91cd\u8981\u60c5\u51b5\uff0c\u9047\u5230\u5371\u9669\u65f6\u5f15\u5bfc\u60a8\u6c42\u52a9\u3002\u60a8\u60f3\u5148\u804a\u804a\uff0c\u8fd8\u662f\u8bbe\u4e2a\u63d0\u9192\uff1f";
-  }
-
-  if (includesAny(normalized, ["提醒", "吃药", "喝水", "复诊", "闹钟", "记得"])) {
-    return "\u53ef\u4ee5\u3002\u6211\u80fd\u5e2e\u60a8\u8bb0\u5403\u836f\uff0c\u559d\u6c34\uff0c\u590d\u8bca\u8fd9\u4e9b\u63d0\u9192\u3002\u60a8\u53ef\u4ee5\u76f4\u63a5\u544a\u8bc9\u6211\u65f6\u95f4\u548c\u4e8b\u60c5\uff0c\u4e5f\u53ef\u4ee5\u53bb\u63d0\u9192\u9875\u624b\u52a8\u65b0\u589e\u3002";
-  }
-
-  if (includesAny(normalized, ["孤单", "孤独", "无聊", "难过", "烦", "陪我聊", "想聊天"])) {
-    return "\u542c\u8d77\u6765\u60a8\u73b0\u5728\u9700\u8981\u6709\u4eba\u966a\u60a8\u8bf4\u8bdd\u3002\u6211\u5728\u8fd9\u91cc\u3002\u60a8\u6700\u60f3\u804a\u7684\u662f\u5bb6\u91cc\u4eba\uff0c\u8eab\u4f53\u60c5\u51b5\uff0c\u8fd8\u662f\u4eca\u5929\u53d1\u751f\u7684\u4e8b\uff1f";
-  }
-
-  if (includesAny(normalized, ["谢谢", "麻烦你", "辛苦了"])) {
-    return "\u4e0d\u5ba2\u6c14\u3002\u6211\u4f1a\u7ee7\u7eed\u966a\u7740\u60a8\u3002\u60a8\u8fd8\u60f3\u804a\u804a\uff0c\u8fd8\u662f\u9700\u8981\u6211\u5e2e\u60a8\u8bbe\u4e2a\u63d0\u9192\uff1f";
-  }
-
-  if (includesAny(normalized, ["睡不着", "失眠", "睡不好"])) {
-    return "\u665a\u4e0a\u7761\u4e0d\u7740\u4f1a\u5f88\u96be\u53d7\u3002\u6211\u4e0d\u505a\u533b\u7597\u8bca\u65ad\uff0c\u4f46\u60a8\u53ef\u4ee5\u5148\u8bd5\u8bd5\u653e\u6162\u547c\u5438\uff0c\u55dd\u70b9\u6e29\u6c34\uff0c\u5c11\u770b\u523a\u6fc0\u5185\u5bb9\u3002\u5982\u679c\u60a8\u613f\u610f\uff0c\u6211\u53ef\u4ee5\u5148\u966a\u60a8\u804a\u4e00\u4f1a\u513f\u3002";
-  }
-
-  if (includesAny(normalized, ["头疼", "头痛", "肚子疼", "胃不舒服", "咳嗽", "发烧", "鼻塞", "乏力", "腿疼", "腰酸"])) {
-    return "\u542c\u8d77\u6765\u60a8\u8eab\u4f53\u6709\u4e9b\u4e0d\u8212\u670d\u3002\u6211\u4e0d\u80fd\u76f4\u63a5\u505a\u533b\u7597\u8bca\u65ad\uff0c\u4f46\u5efa\u8bae\u60a8\u5148\u4f11\u606f\uff0c\u559d\u70b9\u6e29\u6c34\uff0c\u7559\u610f\u75c7\u72b6\u6709\u6ca1\u6709\u52a0\u91cd\u3002\u5982\u679c\u540c\u65f6\u51fa\u73b0\u80f8\u75db\uff0c\u547c\u5438\u56f0\u96be\uff0c\u660f\u5012\u6216\u75c7\u72b6\u660e\u663e\u52a0\u91cd\uff0c\u8bf7\u7acb\u5373\u6c42\u52a9\u3002";
+    return "听起来您身体有些不舒服。我不能直接做医疗诊断，但建议您先休息、喝点温水，留意症状有没有加重。如果同时出现胸痛、呼吸困难、晕倒或症状明显加重，请立即求助。";
   }
 
   if (includesAny(normalized, ["家人", "儿子", "女儿", "孙子", "孙女", "老伴", "家里人"])) {
-    return "\u60a8\u63d0\u5230\u5bb6\u91cc\u4eba\u4e86\u3002\u662f\u60f3\u804a\u804a\u4ed6\u4eec\uff0c\u8fd8\u662f\u60f3\u8bb0\u4e00\u4ef6\u7a0d\u540e\u8981\u544a\u8bc9\u5bb6\u5c5e\u7684\u4e8b\u60c5\uff1f";
+    return "您提到家里人了。是想聊聊他们，还是想记一件稍后要告诉家属的事情？";
   }
 
   if (includesAny(normalized, ["天气", "下雨", "温度", "新闻", "今天发生什么"])) {
-    return "\u6211\u8fd9\u4e2a\u7248\u672c\u6682\u65f6\u4e0d\u76f4\u63a5\u67e5\u5b9e\u65f6\u5929\u6c14\u548c\u65b0\u95fb\u3002\u5982\u679c\u60a8\u662f\u62c5\u5fc3\u51fa\u95e8\uff0c\u7a7f\u8863\uff0c\u5e26\u4f1e\u8fd9\u7c7b\u95ee\u9898\uff0c\u6211\u53ef\u4ee5\u5148\u966a\u60a8\u62c6\u89e3\u8981\u505a\u4ec0\u4e48\u51c6\u5907\u3002";
+    return "我这个版本暂时不直接查实时天气和新闻。如果您是担心出门、穿衣、带伞这类问题，我可以先陪您拆解要做什么准备。";
   }
 
   if (isQuestion(text)) {
-    return `\u6211\u660e\u767d\u60a8\u5728\u95ee\u201c${extractTopic(text)}\u201d\u3002\u5c31\u8fd9\u4e2a\u7248\u672c\u6765\u8bf4\uff0c\u6211\u66f4\u64c5\u957f\u966a\u804a\uff0c\u63d0\u9192\u548c\u5b89\u5168\u6c42\u52a9\u3002\u60a8\u662f\u60f3\u8981\u6211\u76f4\u63a5\u5e2e\u60a8\u505a\u4e0b\u4e00\u6b65\uff0c\u8fd8\u662f\u5148\u548c\u6211\u8bf4\u8bf4\u60a8\u62c5\u5fc3\u7684\u70b9\uff1f`;
+    return `我明白您在问“${extractTopic(text)}”。就这个版本来说，我更擅长陪聊、提醒和安全求助。您是想让我直接帮您做下一步，还是先和我说说您担心的点？`;
   }
 
-  return `\u6211\u542c\u5230\u60a8\u5728\u8bf4\u201c${extractTopic(text)}\u201d\u3002\u8fd9\u4ef6\u4e8b\u66f4\u50cf\u662f\u8ba9\u60a8\u62c5\u5fc3\uff0c\u8eab\u4f53\u4e0d\u8212\u670d\uff0c\u8fd8\u662f\u53ea\u662f\u60f3\u627e\u4eba\u804a\u804a\uff1f`;
+  return `我听到您在说“${extractTopic(text)}”。这件事更像是让您担心、身体不舒服，还是只是想找人聊聊？`;
 }
 
 function addChat(role: Role, text: string, risk = false): void {
@@ -193,7 +237,7 @@ function createEmergency(source: EmergencySource, triggerText: string): Emergenc
     triggerText,
     createdAt: new Date().toISOString(),
     status: "open",
-    actionLog: ["\u521b\u5efa\u4e8b\u4ef6"]
+    actionLog: ["创建事件"]
   };
   emergencies.unshift(event);
   return event;
@@ -203,7 +247,7 @@ function buildFamilyTimeline(): FamilyTimelineItem[] {
   const chatItems: FamilyTimelineItem[] = messages.slice(-40).map((item) => ({
     id: `chat-${item.id}`,
     type: "chat",
-    title: item.role === "user" ? "\u7528\u6237\u5bf9\u8bdd" : "\u52a9\u624b\u56de\u590d",
+    title: item.role === "user" ? "用户对话" : "助手回复",
     description: item.text,
     createdAt: item.createdAt,
     level: item.risk ? "warning" : "normal"
@@ -212,8 +256,8 @@ function buildFamilyTimeline(): FamilyTimelineItem[] {
   const reminderItems: FamilyTimelineItem[] = reminders.map((item) => ({
     id: `reminder-${item.id}`,
     type: "reminder",
-    title: "\u63d0\u9192\u4e8b\u9879",
-    description: `${item.title} · ${item.status}`,
+    title: "提醒事项",
+    description: `${item.title} / ${item.status}`,
     createdAt: item.time,
     level: item.status === "pending" ? "warning" : "normal"
   }));
@@ -221,7 +265,7 @@ function buildFamilyTimeline(): FamilyTimelineItem[] {
   const emergencyItems: FamilyTimelineItem[] = emergencies.map((item) => ({
     id: `emergency-${item.id}`,
     type: "emergency",
-    title: "\u7d27\u6025\u4e8b\u4ef6",
+    title: "紧急事件",
     description: item.triggerText,
     createdAt: item.createdAt,
     level: "warning"
@@ -232,6 +276,83 @@ function buildFamilyTimeline(): FamilyTimelineItem[] {
   );
 }
 
+async function readResponseJson<T>(response: globalThis.Response): Promise<T> {
+  const text = await response.text();
+  return JSON.parse(text) as T;
+}
+
+async function transcribeWithAliyunNls(audioBuffer: Buffer): Promise<string> {
+  const url = new URL(`https://nls-gateway-${ALIYUN_NLS_REGION}.aliyuncs.com/stream/v1/asr`);
+  url.searchParams.set("appkey", ALIYUN_NLS_APPKEY);
+  url.searchParams.set("format", "wav");
+  url.searchParams.set("sample_rate", "16000");
+  url.searchParams.set("enable_punctuation_prediction", "true");
+  url.searchParams.set("enable_inverse_text_normalization", "true");
+  url.searchParams.set("enable_voice_detection", "true");
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "X-NLS-Token": ALIYUN_NLS_TOKEN,
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(audioBuffer.byteLength)
+    },
+    body: new Uint8Array(audioBuffer)
+  });
+
+  const data = await readResponseJson<{ status?: number; message?: string; result?: string }>(
+    response
+  );
+
+  if (response.ok && data.result?.trim()) {
+    return data.result.trim();
+  }
+
+  throw new Error(data.message || `阿里云语音识别失败（${data.status ?? response.status}）`);
+}
+
+async function transcribeWithOpenAi(audioBuffer: Buffer): Promise<string> {
+  const formData = new FormData();
+  formData.append(
+    "file",
+    new Blob([new Uint8Array(audioBuffer)], {
+      type: "audio/wav"
+    }),
+    "recording.wav"
+  );
+  formData.append("model", OPENAI_TRANSCRIPTION_MODEL);
+  formData.append("language", "zh");
+  formData.append("response_format", "json");
+
+  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: formData
+  });
+
+  const data = await readResponseJson<{ text?: string; error?: { message?: string } }>(response);
+
+  if (response.ok && data.text?.trim()) {
+    return data.text.trim();
+  }
+
+  throw new Error(data.error?.message || `OpenAI 语音识别失败（${response.status}）`);
+}
+
+async function transcribeAudio(audioBuffer: Buffer): Promise<string> {
+  if (voiceCapabilities.provider === "aliyun-nls") {
+    return transcribeWithAliyunNls(audioBuffer);
+  }
+
+  if (voiceCapabilities.provider === "openai") {
+    return transcribeWithOpenAi(audioBuffer);
+  }
+
+  throw new Error("服务器未配置语音识别服务");
+}
+
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({
     ok: true,
@@ -239,6 +360,44 @@ app.get("/api/health", (_req: Request, res: Response) => {
     time: new Date().toISOString()
   });
 });
+
+app.get("/api/voice/capabilities", (_req: Request, res: Response) => {
+  res.json(voiceCapabilities);
+});
+
+app.post(
+  "/api/voice/transcribe",
+  express.raw({
+    type: ["audio/wav", "audio/x-wav", "application/octet-stream"],
+    limit: "10mb"
+  }),
+  async (req: Request, res: Response) => {
+    if (!voiceCapabilities.enabled) {
+      res.status(503).json({ error: voiceCapabilities.note });
+      return;
+    }
+
+    const audioBuffer = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!audioBuffer || audioBuffer.byteLength < 512) {
+      res.status(400).json({ error: "录音内容太短，请再说一遍。" });
+      return;
+    }
+
+    try {
+      const text = await transcribeAudio(audioBuffer);
+      if (!text.trim()) {
+        res.status(422).json({ error: "没有识别到有效内容，请再说一遍。" });
+        return;
+      }
+
+      res.json({ text, provider: voiceCapabilities.provider });
+    } catch (error) {
+      console.error("voice transcription failed", error);
+      const message = error instanceof Error ? error.message : "语音识别失败";
+      res.status(502).json({ error: message });
+    }
+  }
+);
 
 app.post("/api/chat", (req: Request, res: Response) => {
   const message = String(req.body?.message ?? "").trim();
@@ -298,7 +457,12 @@ app.patch("/api/reminders/:id/ack", (req: Request, res: Response) => {
     return;
   }
 
-  if (!["pending", "done", "snooze", "skip"].includes(action)) {
+  if (![
+    "pending",
+    "done",
+    "snooze",
+    "skip"
+  ].includes(action)) {
     res.status(400).json({ error: "invalid action" });
     return;
   }
@@ -329,13 +493,13 @@ app.get("/api/emergencies/:id", (req: Request, res: Response) => {
 
 app.post("/api/emergencies/manual", (req: Request, res: Response) => {
   const triggerText = String(req.body?.triggerText ?? "").trim();
-  const event = createEmergency("manual", triggerText || "\u7528\u6237\u624b\u52a8\u89e6\u53d1");
+  const event = createEmergency("manual", triggerText || "用户手动触发");
   res.status(201).json({ item: event });
 });
 
 app.patch("/api/emergencies/:id/resolve", (req: Request, res: Response) => {
   const id = Number(req.params.id);
-  const actionText = String(req.body?.actionText ?? "\u6807\u8bb0\u4e3a\u5df2\u5904\u7406");
+  const actionText = String(req.body?.actionText ?? "标记为已处理");
   const event = emergencies.find((item) => item.id === id);
   if (!event) {
     res.status(404).json({ error: "event not found" });
@@ -376,4 +540,8 @@ if (hasFrontendBuild) {
 
 app.listen(PORT, () => {
   console.log(`backend started on :${PORT}`);
+  console.log(`voice transcription provider: ${voiceCapabilities.provider}`);
 });
+
+
+
