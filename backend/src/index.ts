@@ -303,7 +303,13 @@ app.patch("/api/reminders/:id/ack", (req: Request, res: Response) => {
     return;
   }
 
-  reminder.status = action;
+  if (action === "snooze") {
+    reminder.status = "pending";
+    reminder.time = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  } else {
+    reminder.status = action;
+  }
+
   res.json({ item: reminder });
 });
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 
 type Tab = "chat" | "reminder" | "logs" | "family" | "eventDetail";
 type ReminderStatus = "pending" | "done" | "snooze" | "skip";
@@ -54,6 +54,7 @@ const voiceStatus = ref("");
 const reminders = ref<Reminder[]>([]);
 const messages = ref<ChatMessage[]>([]);
 const emergencies = ref<EmergencyEvent[]>([]);
+const activeDueReminder = ref<Reminder | null>(null);
 const familySummary = ref<FamilySummary>({
   totalMessages: 0,
   openEmergencies: 0,
@@ -69,6 +70,8 @@ let recognition: SpeechRecognition | null = null;
 let recognitionStarting = false;
 let stopRequested = false;
 let receivedResult = false;
+let reminderTimer: number | null = null;
+const notifiedReminderKeys = new Set<string>();
 
 const isSecureOrigin = computed(() => {
   return (
@@ -82,6 +85,10 @@ const canUseSpeechRecognition = computed(() => {
   return Boolean(window.SpeechRecognition || withKit.webkitSpeechRecognition);
 });
 
+const isEdgeMobile = computed(() => {
+  return /EdgA|EdgiOS/i.test(window.navigator.userAgent);
+});
+
 const voiceButtonDisabled = computed(() => {
   return !canUseSpeechRecognition.value;
 });
@@ -92,6 +99,9 @@ const voiceTip = computed(() => {
   }
   if (!canUseSpeechRecognition.value) {
     return "当前浏览器不支持语音识别。优先使用系统浏览器中的 Android Chrome。";
+  }
+  if (isEdgeMobile.value) {
+    return "当前是 Edge 手机浏览器。它经常拿到麦克风权限后仍中断语音识别，优先改用系统 Chrome。";
   }
   if (!isSecureOrigin.value) {
     return "当前不是 HTTPS 页面，很多手机浏览器会直接禁用语音识别。";
@@ -200,7 +210,9 @@ function createRecognitionSession(): SpeechRecognition | null {
     if (event.error === "aborted") {
       voiceStatus.value = stopRequested
         ? "已停止录音。"
-        : "浏览器中断了本次语音识别。请再点一次重试；如果还失败，请改用系统浏览器或直接打字。";
+        : isEdgeMobile.value
+          ? "Edge 手机浏览器中断了本次语音识别。即使麦克风权限已允许，它也可能直接终止识别。请优先改用系统 Chrome 或直接打字。"
+          : "浏览器中断了本次语音识别。请再点一次重试；如果还失败，请改用系统浏览器或直接打字。";
       return;
     }
 
@@ -340,6 +352,45 @@ async function refreshAll(): Promise<void> {
   ]);
 }
 
+function buildReminderKey(reminder: Reminder): string {
+  return `${reminder.id}:${reminder.time}`;
+}
+
+function checkDueReminders(): void {
+  const now = Date.now();
+  const dueReminder = reminders.value.find((item) => {
+    if (item.status !== "pending") {
+      return false;
+    }
+
+    const dueAt = new Date(item.time).getTime();
+    if (Number.isNaN(dueAt)) {
+      return false;
+    }
+
+    return dueAt <= now;
+  });
+
+  if (!dueReminder) {
+    return;
+  }
+
+  const reminderKey = buildReminderKey(dueReminder);
+  if (notifiedReminderKeys.has(reminderKey)) {
+    return;
+  }
+
+  notifiedReminderKeys.add(reminderKey);
+  activeDueReminder.value = dueReminder;
+  speak(`提醒您：${dueReminder.title}`);
+
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("老人陪伴助手提醒", {
+      body: dueReminder.title
+    });
+  }
+}
+
 async function sendMessage(): Promise<void> {
   const text = chatInput.value.trim();
   if (!text || loading.value) {
@@ -421,6 +472,10 @@ async function ackReminder(id: number, action: ReminderStatus): Promise<void> {
     body: JSON.stringify({ action })
   });
 
+  if (activeDueReminder.value?.id === id) {
+    activeDueReminder.value = null;
+  }
+
   await refreshAll();
 }
 
@@ -465,6 +520,20 @@ async function resolveSelectedEmergency(): Promise<void> {
 
 onMounted(async () => {
   await refreshAll();
+
+  if ("Notification" in window && Notification.permission === "default") {
+    void Notification.requestPermission().catch(() => undefined);
+  }
+
+  reminderTimer = window.setInterval(() => {
+    checkDueReminders();
+  }, 10000);
+});
+
+onUnmounted(() => {
+  if (reminderTimer !== null) {
+    window.clearInterval(reminderTimer);
+  }
 });
 </script>
 
@@ -483,6 +552,17 @@ onMounted(async () => {
     <section v-if="emergencyMode" class="emergency-banner">
       <strong>紧急模式中</strong>
       <p>优先执行：拨打 120 或联系紧急联系人。</p>
+    </section>
+
+    <section v-if="activeDueReminder" class="emergency-banner">
+      <strong>提醒到了：{{ activeDueReminder.title }}</strong>
+      <p>{{ formatTime(activeDueReminder.time) }}</p>
+      <div class="due-actions">
+        <button type="button" @click="ackReminder(activeDueReminder.id, 'done')">已完成</button>
+        <button type="button" @click="ackReminder(activeDueReminder.id, 'snooze')">
+          10分钟后再提醒
+        </button>
+      </div>
     </section>
 
     <nav class="tabs">
