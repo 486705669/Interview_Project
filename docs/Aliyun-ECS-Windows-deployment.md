@@ -57,7 +57,7 @@ deploy\windows\cloudflared-token.txt
 5. Register startup tasks:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\register-startup-tasks.ps1
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\register-startup-tasks.ps1 -IncludeCloudflared
 ```
 
 6. Start once immediately for testing:
@@ -89,4 +89,3 @@ curl https://app.your-domain.com/api/health
 - This route does not require Nginx on the ECS host.
 - It also does not require Docker on the ECS host.
 - For mobile microphone access, open the final Cloudflare HTTPS hostname in a system browser.
-

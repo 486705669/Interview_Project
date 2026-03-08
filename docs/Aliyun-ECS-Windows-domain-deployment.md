@@ -100,4 +100,3 @@ curl https://jiahaochen.xyz/api/health
 ## Notes
 - Caddy can issue and renew HTTPS certificates automatically when the domain already resolves to this server and ports `80` and `443` are open.
 - For mobile speech input, always test with the final HTTPS domain in a system browser.
-
