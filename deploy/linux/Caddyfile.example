@@ -1,0 +1,4 @@
+jiahaochen.xyz, www.jiahaochen.xyz {
+  encode gzip zstd
+  reverse_proxy 127.0.0.1:3000
+}

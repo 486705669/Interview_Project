@@ -71,6 +71,11 @@ If you want to bind a real domain directly to the Windows ECS host, use Caddy as
 
 See `docs/Aliyun-ECS-Windows-domain-deployment.md` for the full flow.
 
+## Aliyun ECS Linux With Domain
+For a Linux ECS host, use the scripts in `deploy/linux/` and put Caddy in front of the backend.
+
+See `docs/Aliyun-ECS-Linux-domain-deployment.md` for the full flow.
+
 ## Server-Side Voice Recognition
 The mobile web now uses `press-and-hold to record -> upload WAV -> server-side transcription`.
 
