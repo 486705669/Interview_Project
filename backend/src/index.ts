@@ -412,8 +412,9 @@ async function transcribeWithAliyunNls(audioBuffer: Buffer): Promise<string> {
     response
   );
 
-  if (response.ok && data.result?.trim()) {
-    return data.result.trim();
+  const transcript = data.result?.trim() ?? "";
+  if (response.ok && (data.message === "SUCCESS" || data.status === 20000000)) {
+    return transcript;
   }
 
   throw new Error(data.message || `阿里云语音识别失败（${data.status ?? response.status}）`);
