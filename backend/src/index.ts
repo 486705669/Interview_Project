@@ -83,6 +83,8 @@ const OPENAI_TRANSCRIPTION_MODEL =
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY?.trim() ?? "";
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com";
+const APP_TIME_ZONE =
+  process.env.APP_TIME_ZONE?.trim() || process.env.TZ?.trim() || "Asia/Shanghai";
 const ALIYUN_NLS_APPKEY = process.env.ALIYUN_NLS_APPKEY?.trim() ?? "";
 const ALIYUN_NLS_TOKEN = process.env.ALIYUN_NLS_TOKEN?.trim() ?? "";
 const ALIYUN_AK_ID =
@@ -163,6 +165,38 @@ function resolveVoiceCapabilities(): VoiceCapabilities {
     enabled: false,
     provider: "disabled",
     note: "服务器还没有配置服务端语音识别，请先用打字。"
+  };
+}
+
+function getCurrentTimeSnapshot(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: APP_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+  const parts = formatter.formatToParts(date);
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const year = map.year ?? "";
+  const month = map.month ?? "";
+  const day = map.day ?? "";
+  const hour = map.hour ?? "";
+  const minute = map.minute ?? "";
+  const second = map.second ?? "";
+  const weekday = map.weekday ?? "";
+
+  return {
+    nowIso: date.toISOString(),
+    timeZone: APP_TIME_ZONE,
+    localDateText: `${year}年${month}月${day}日`,
+    localTimeText: `${hour}:${minute}:${second}`,
+    weekdayText: weekday,
+    nowLocalText: `${year}年${month}月${day}日 ${weekday} ${hour}:${minute}:${second}`
   };
 }
 
@@ -389,8 +423,14 @@ function createCareNote(
 }
 
 function buildAgentContext(userMessage: string, heuristicRisk: boolean) {
+  const currentTime = getCurrentTimeSnapshot();
   return {
-    nowIso: new Date().toISOString(),
+    nowIso: currentTime.nowIso,
+    timeZone: currentTime.timeZone,
+    nowLocalText: currentTime.nowLocalText,
+    localDateText: currentTime.localDateText,
+    localTimeText: currentTime.localTimeText,
+    weekdayText: currentTime.weekdayText,
     userMessage,
     recentMessages: messages.slice(-12).map((item) => ({
       role: item.role,
@@ -422,6 +462,24 @@ function executeAgentToolCalls(toolCalls: AgentToolCall[], fallbackMessage: stri
   let createdEmergency = false;
 
   for (const toolCall of toolCalls.slice(0, 4)) {
+    if (toolCall.name === "get_current_time") {
+      const currentTime = getCurrentTimeSnapshot();
+      toolResults.push({
+        toolCallId: toolCall.id,
+        name: "get_current_time",
+        content: JSON.stringify({
+          ok: true,
+          nowIso: currentTime.nowIso,
+          timeZone: currentTime.timeZone,
+          nowLocalText: currentTime.nowLocalText,
+          localDateText: currentTime.localDateText,
+          localTimeText: currentTime.localTimeText,
+          weekdayText: currentTime.weekdayText
+        })
+      });
+      continue;
+    }
+
     if (toolCall.name === "create_reminder") {
       const title = String(toolCall.arguments.title ?? "").trim();
       const time = String(toolCall.arguments.time ?? "").trim();

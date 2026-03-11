@@ -1,4 +1,8 @@
-﻿export type AgentToolCallName = "create_reminder" | "create_emergency" | "record_note";
+﻿export type AgentToolCallName =
+  | "create_reminder"
+  | "create_emergency"
+  | "record_note"
+  | "get_current_time";
 
 export interface AgentToolCall {
   id: string;
@@ -45,6 +49,11 @@ export interface AgentContextNote {
 
 export interface AgentContext {
   nowIso: string;
+  timeZone: string;
+  nowLocalText: string;
+  localDateText: string;
+  localTimeText: string;
+  weekdayText: string;
   userMessage: string;
   recentMessages: AgentContextMessage[];
   reminders: AgentContextReminder[];
@@ -103,6 +112,7 @@ const CARE_AGENT_SYSTEM_PROMPT = `
 - 症状快速恶化且老人独居
 
 工具使用规则：
+- get_current_time：当用户问“现在几点”“今天几号”“星期几”“今天周几”这类当前时间问题时，优先调用这个工具，不要凭记忆猜测。
 - create_reminder：当用户明确提出提醒需求，或你能根据上下文合理判断需要提醒吃药、喝水、复诊、休息时调用。
 - create_emergency：当出现高风险表达，或需要留下紧急事件记录时调用。
 - record_note：当用户提到身体不舒服、睡眠、情绪、食欲、活动状态等值得追踪的信息时调用。
@@ -114,9 +124,23 @@ const CARE_AGENT_SYSTEM_PROMPT = `
 - 句子短，不要长篇大论。
 - 不要说“作为一个AI”。
 - 不要输出 Markdown。
+- 所有时间、日期、星期相关回答，都必须以上下文里的 nowLocalText、localDateText、localTimeText、weekdayText 或工具返回结果为准。
 `;
 
 const DEEPSEEK_TOOLS: DeepSeekToolDefinition[] = [
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description:
+        "Get the current local time, current date, weekday, and timezone from the server for accurate answers.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false
+      }
+    }
+  },
   {
     type: "function",
     function: {
@@ -192,11 +216,27 @@ const DEEPSEEK_TOOLS: DeepSeekToolDefinition[] = [
 ];
 
 function normalizeToolCallName(name: string): AgentToolCallName | null {
-  if (name === "create_reminder" || name === "create_emergency" || name === "record_note") {
+  if (
+    name === "create_reminder" ||
+    name === "create_emergency" ||
+    name === "record_note" ||
+    name === "get_current_time"
+  ) {
     return name;
   }
 
   return null;
+}
+
+function isCurrentTimeQuestion(text: string): boolean {
+  const normalized = text.replace(/\s+/g, "");
+  return /现在几点|几点了|当前时间|今天几号|今天几月几号|今天星期几|今天周几|星期几|周几|几号/u.test(
+    normalized
+  );
+}
+
+function buildCurrentTimeReply(context: AgentContext): string {
+  return `现在是${context.nowLocalText}，时区是${context.timeZone}。`;
 }
 
 function parseToolCalls(message: DeepSeekChatMessage | undefined): AgentToolCall[] {
@@ -297,6 +337,7 @@ export async function callDeepSeekCareAgent(options: {
   if (toolCalls.length === 0) {
     return {
       assistantReply:
+        (isCurrentTimeQuestion(context.userMessage) ? buildCurrentTimeReply(context) : "") ||
         firstMessage.content?.trim() ||
         "我在这儿。您再跟我说具体一点，我来一步步帮您处理。",
       risk: context.heuristicRisk,

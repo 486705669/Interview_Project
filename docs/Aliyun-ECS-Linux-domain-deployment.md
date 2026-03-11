@@ -39,6 +39,7 @@ nano deploy/linux/backend.env
 ```
 
 Fill your own values for Aliyun speech recognition and DeepSeek.
+Set `APP_TIME_ZONE` to your deployment timezone, for example `Asia/Hong_Kong`.
 
 ## 4. Build the app
 

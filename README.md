@@ -82,6 +82,7 @@ The mobile web now uses `press-and-hold to record -> upload WAV -> server-side t
 For a Windows ECS host, create `deploy/windows/backend.env` from `deploy/windows/backend.env.example` and choose one provider:
 
 ```text
+APP_TIME_ZONE=Asia/Shanghai
 ALIYUN_NLS_APPKEY=your_appkey
 ALIYUN_AK_ID=your_access_key_id
 ALIYUN_AK_SECRET=your_access_key_secret
@@ -107,11 +108,13 @@ OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 The branch `codex/deepseek-agent-upgrade` upgrades `/api/chat` to a DeepSeek-powered agent flow:
 - the model replies as the companion assistant
 - the model can decide to create reminders, record health notes, or open emergency events
+- the model can fetch current local time from the server instead of guessing
 - the original rule-based logic remains as a fallback when the model is unavailable
 
 Environment variables:
 
 ```text
+APP_TIME_ZONE=Asia/Hong_Kong
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DEEPSEEK_MODEL=deepseek-chat
 DEEPSEEK_BASE_URL=https://api.deepseek.com
