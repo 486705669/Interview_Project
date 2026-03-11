@@ -94,6 +94,13 @@ interface DeepSeekChatCompletionResponse {
   };
 }
 
+const DSML_FUNCTION_CALLS_PATTERN =
+  /<[^>]*DSML[^>]*function_calls>[\s\S]*?<\/[^>]*DSML[^>]*function_calls>/giu;
+const DSML_INVOKE_PATTERN =
+  /<[^>]*DSML[^>]*invoke name="([^"]+)">([\s\S]*?)<\/[^>]*DSML[^>]*invoke>/giu;
+const DSML_PARAMETER_PATTERN =
+  /<[^>]*DSML[^>]*parameter name="([^"]+)"(?: [^>]*)?>([\s\S]*?)<\/[^>]*DSML[^>]*parameter>/giu;
+
 const CARE_AGENT_SYSTEM_PROMPT = `
 你是“老人陪伴助手”，服务对象是 60 岁以上老人。
 
@@ -124,6 +131,7 @@ const CARE_AGENT_SYSTEM_PROMPT = `
 - 句子短，不要长篇大论。
 - 不要说“作为一个AI”。
 - 不要输出 Markdown。
+- 不要把任何工具调用标签、DSML 标签、XML 标签直接展示给用户。
 - 所有时间、日期、星期相关回答，都必须以上下文里的 nowLocalText、localDateText、localTimeText、weekdayText 或工具返回结果为准。
 `;
 
@@ -239,37 +247,170 @@ function buildCurrentTimeReply(context: AgentContext): string {
   return `现在是${context.nowLocalText}，时区是${context.timeZone}。`;
 }
 
-function parseToolCalls(message: DeepSeekChatMessage | undefined): AgentToolCall[] {
-  if (!message?.tool_calls?.length) {
+function sanitizeAssistantContent(content: string | null | undefined): string {
+  if (!content) {
+    return "";
+  }
+
+  return content
+    .replace(DSML_FUNCTION_CALLS_PATTERN, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeRecordNoteCategory(rawValue: unknown): "symptom" | "habit" | "mood" | "safety" {
+  const text = String(rawValue ?? "")
+    .trim()
+    .toLowerCase();
+  if (!text) {
+    return "symptom";
+  }
+
+  if (/(habit|习惯|吃药|服药|用药|作息|喝水)/u.test(text)) {
+    return "habit";
+  }
+
+  if (/(mood|情绪|心情|焦虑|难过|孤独|烦)/u.test(text)) {
+    return "mood";
+  }
+
+  if (/(safety|安全|跌倒|摔倒|走失|危险)/u.test(text)) {
+    return "safety";
+  }
+
+  return "symptom";
+}
+
+function normalizeRecordNoteLevel(rawValue: unknown, summary: string): "normal" | "warning" {
+  const text = String(rawValue ?? "")
+    .trim()
+    .toLowerCase();
+  if (/(warning|高风险|异常|加重|危险|紧急)/u.test(text)) {
+    return "warning";
+  }
+
+  if (/(胸痛|呼吸困难|晕倒|昏迷|剧烈头痛)/u.test(summary)) {
+    return "warning";
+  }
+
+  return "normal";
+}
+
+function parseDsmlToolCalls(content: string | null | undefined): AgentToolCall[] {
+  if (!content || !content.includes("DSML")) {
     return [];
   }
 
-  return message.tool_calls
-    .map((item): AgentToolCall | null => {
-      const normalizedName = normalizeToolCallName(item.function.name);
-      if (!normalizedName) {
-        return null;
+  const toolCalls: AgentToolCall[] = [];
+  for (const invokeMatch of content.matchAll(DSML_INVOKE_PATTERN)) {
+    const rawName = invokeMatch[1]?.trim() || "";
+    const normalizedName = normalizeToolCallName(rawName);
+    if (!normalizedName) {
+      continue;
+    }
+
+    const rawArgs: Record<string, string> = {};
+    const body = invokeMatch[2] ?? "";
+    for (const paramMatch of body.matchAll(DSML_PARAMETER_PATTERN)) {
+      const key = paramMatch[1]?.trim();
+      if (!key) {
+        continue;
       }
 
-      try {
-        const parsedArguments = JSON.parse(item.function.arguments || "{}");
-        return {
-          id: item.id,
-          name: normalizedName,
-          arguments:
-            parsedArguments && typeof parsedArguments === "object"
-              ? (parsedArguments as Record<string, unknown>)
-              : {}
-        };
-      } catch {
-        return {
-          id: item.id,
-          name: normalizedName,
-          arguments: {}
-        };
-      }
-    })
-    .filter((item): item is AgentToolCall => item !== null);
+      rawArgs[key] = (paramMatch[2] ?? "").trim();
+    }
+
+    let argumentsObject: Record<string, unknown> = rawArgs;
+    if (normalizedName === "record_note") {
+      const summary =
+        rawArgs.summary?.trim() ||
+        rawArgs.content?.trim() ||
+        rawArgs.note?.trim() ||
+        rawArgs.text?.trim() ||
+        "";
+      argumentsObject = {
+        summary,
+        category: normalizeRecordNoteCategory(rawArgs.category),
+        level: normalizeRecordNoteLevel(rawArgs.level, summary)
+      };
+    } else if (normalizedName === "create_reminder") {
+      argumentsObject = {
+        title:
+          rawArgs.title?.trim() ||
+          rawArgs.task?.trim() ||
+          rawArgs.content?.trim() ||
+          rawArgs.reminder?.trim() ||
+          "提醒事项",
+        time:
+          rawArgs.time?.trim() ||
+          rawArgs.at?.trim() ||
+          rawArgs.datetime?.trim() ||
+          rawArgs.remind_at?.trim() ||
+          ""
+      };
+    } else if (normalizedName === "create_emergency") {
+      argumentsObject = {
+        triggerText:
+          rawArgs.triggerText?.trim() ||
+          rawArgs.trigger?.trim() ||
+          rawArgs.content?.trim() ||
+          rawArgs.summary?.trim() ||
+          "",
+        actionText:
+          rawArgs.actionText?.trim() ||
+          rawArgs.reason?.trim() ||
+          "模型判定需要重点关注"
+      };
+    }
+
+    toolCalls.push({
+      id: `dsml_${toolCalls.length + 1}`,
+      name: normalizedName,
+      arguments: argumentsObject
+    });
+  }
+
+  return toolCalls;
+}
+
+function parseToolCalls(message: DeepSeekChatMessage | undefined): AgentToolCall[] {
+  if (!message) {
+    return [];
+  }
+
+  const structuredToolCalls =
+    message.tool_calls
+      ?.map((item): AgentToolCall | null => {
+        const normalizedName = normalizeToolCallName(item.function.name);
+        if (!normalizedName) {
+          return null;
+        }
+
+        try {
+          const parsedArguments = JSON.parse(item.function.arguments || "{}");
+          return {
+            id: item.id,
+            name: normalizedName,
+            arguments:
+              parsedArguments && typeof parsedArguments === "object"
+                ? (parsedArguments as Record<string, unknown>)
+                : {}
+          };
+        } catch {
+          return {
+            id: item.id,
+            name: normalizedName,
+            arguments: {}
+          };
+        }
+      })
+      .filter((item): item is AgentToolCall => item !== null) ?? [];
+
+  if (structuredToolCalls.length > 0) {
+    return structuredToolCalls;
+  }
+
+  return parseDsmlToolCalls(message.content);
 }
 
 async function requestDeepSeek(options: {
@@ -335,10 +476,11 @@ export async function callDeepSeekCareAgent(options: {
   const toolCalls = parseToolCalls(firstMessage);
 
   if (toolCalls.length === 0) {
+    const cleanedFirstReply = sanitizeAssistantContent(firstMessage.content);
     return {
       assistantReply:
         (isCurrentTimeQuestion(context.userMessage) ? buildCurrentTimeReply(context) : "") ||
-        firstMessage.content?.trim() ||
+        cleanedFirstReply ||
         "我在这儿。您再跟我说具体一点，我来一步步帮您处理。",
       risk: context.heuristicRisk,
       toolCalls: []
@@ -366,11 +508,13 @@ export async function callDeepSeekCareAgent(options: {
     baseUrl,
     messages
   });
+  const cleanedFinalReply = sanitizeAssistantContent(finalMessage.content);
+  const cleanedFirstReply = sanitizeAssistantContent(firstMessage.content);
 
   return {
     assistantReply:
-      finalMessage.content?.trim() ||
-      firstMessage.content?.trim() ||
+      cleanedFinalReply ||
+      cleanedFirstReply ||
       "我已经先帮您记下来了，您再跟我说具体一点，我继续帮您处理。",
     risk:
       context.heuristicRisk || toolCalls.some((item) => item.name === "create_emergency"),
