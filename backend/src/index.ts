@@ -2,7 +2,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { callDeepSeekCareAgent, type AgentToolCall } from "./agent.js";
+import {
+  callDeepSeekCareAgent,
+  type AgentToolCall,
+  type AgentToolResult
+} from "./agent.js";
 import cors from "cors";
 import express, { type Request, type Response } from "express";
 
@@ -414,7 +418,7 @@ function buildAgentContext(userMessage: string, heuristicRisk: boolean) {
 }
 
 function executeAgentToolCalls(toolCalls: AgentToolCall[], fallbackMessage: string) {
-  const summaries: string[] = [];
+  const toolResults: AgentToolResult[] = [];
   let createdEmergency = false;
 
   for (const toolCall of toolCalls.slice(0, 4)) {
@@ -433,7 +437,16 @@ function executeAgentToolCalls(toolCalls: AgentToolCall[], fallbackMessage: stri
         time: parsedTime.toISOString(),
         status: "pending"
       });
-      summaries.push(`已添加提醒：${title}`);
+      toolResults.push({
+        toolCallId: toolCall.id,
+        name: "create_reminder",
+        content: JSON.stringify({
+          ok: true,
+          title,
+          time: parsedTime.toISOString(),
+          message: `已添加提醒：${title}`
+        })
+      });
       continue;
     }
 
@@ -442,7 +455,16 @@ function executeAgentToolCalls(toolCalls: AgentToolCall[], fallbackMessage: stri
       const actionText = String(toolCall.arguments.actionText ?? "模型判定需要重点关注").trim();
       const event = createEmergency("keyword", triggerText || fallbackMessage);
       event.actionLog.push(actionText);
-      summaries.push("已记录紧急事件");
+      toolResults.push({
+        toolCallId: toolCall.id,
+        name: "create_emergency",
+        content: JSON.stringify({
+          ok: true,
+          eventId: event.id,
+          triggerText: event.triggerText,
+          message: "已记录紧急事件"
+        })
+      });
       createdEmergency = true;
       continue;
     }
@@ -465,23 +487,24 @@ function executeAgentToolCalls(toolCalls: AgentToolCall[], fallbackMessage: stri
         level,
         category
       });
-      summaries.push(`已记录：${summary}`);
+      toolResults.push({
+        toolCallId: toolCall.id,
+        name: "record_note",
+        content: JSON.stringify({
+          ok: true,
+          summary,
+          level,
+          category,
+          message: `已记录：${summary}`
+        })
+      });
     }
   }
 
   return {
-    summaries,
+    toolResults,
     createdEmergency
   };
-}
-
-function mergeReplyWithToolSummary(reply: string, summaries: string[]): string {
-  const normalizedReply = reply.trim();
-  if (summaries.length === 0) {
-    return normalizedReply;
-  }
-
-  return `${normalizedReply}\n\n我已经为您处理：${summaries.join("；")}。`;
 }
 
 function buildFamilyTimeline(): FamilyTimelineItem[] {
@@ -664,16 +687,19 @@ app.post("/api/chat", async (req: Request, res: Response) => {
         apiKey: DEEPSEEK_API_KEY,
         model: DEEPSEEK_MODEL,
         baseUrl: DEEPSEEK_BASE_URL,
-        context: buildAgentContext(message, heuristicRisk)
+        context: buildAgentContext(message, heuristicRisk),
+        toolResultsExecutor: (toolCalls) => {
+          return executeAgentToolCalls(toolCalls, message).toolResults;
+        }
       });
-      const toolResult = executeAgentToolCalls(decision.toolCalls, message);
-      risk = heuristicRisk || decision.risk || toolResult.createdEmergency;
+      const createdEmergency = decision.toolCalls.some((item) => item.name === "create_emergency");
+      risk = heuristicRisk || decision.risk || createdEmergency;
 
-      if (risk && !toolResult.createdEmergency) {
+      if (risk && !createdEmergency) {
         createEmergency("keyword", message);
       }
 
-      reply = mergeReplyWithToolSummary(decision.assistantReply, toolResult.summaries);
+      reply = decision.assistantReply;
     } catch (error) {
       console.error("deepseek chat failed", error);
       if (risk) {

@@ -1,9 +1,15 @@
 ﻿export type AgentToolCallName = "create_reminder" | "create_emergency" | "record_note";
 
 export interface AgentToolCall {
+  id: string;
   name: AgentToolCallName;
   arguments: Record<string, unknown>;
-  reason?: string;
+}
+
+export interface AgentToolResult {
+  toolCallId: string;
+  name: AgentToolCallName;
+  content: string;
 }
 
 export interface AgentDecision {
@@ -47,16 +53,32 @@ export interface AgentContext {
   heuristicRisk: boolean;
 }
 
+interface DeepSeekToolDefinition {
+  type: "function";
+  function: {
+    name: AgentToolCallName;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
 interface DeepSeekChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: {
+      name: string;
+      arguments: string;
+    };
+  }>;
 }
 
 interface DeepSeekChatCompletionResponse {
   choices?: Array<{
-    message?: {
-      content?: string;
-    };
+    message?: DeepSeekChatMessage;
   }>;
   error?: {
     message?: string;
@@ -71,6 +93,7 @@ const CARE_AGENT_SYSTEM_PROMPT = `
 2. 在陪伴聊天的同时，主动帮助老人处理提醒、身体不适记录和风险上报。
 3. 你不是医生，不做医疗诊断，不给处方。
 4. 如果发现高风险情况，要优先进入求助路径，并调用 create_emergency 工具。
+5. 如果只是轻度不适、情绪波动、睡眠、食欲、活动状态变化，优先记录并给出生活化建议。
 
 高风险例子：
 - 胸痛、胸闷明显加重
@@ -80,76 +103,167 @@ const CARE_AGENT_SYSTEM_PROMPT = `
 - 症状快速恶化且老人独居
 
 工具使用规则：
-- create_reminder：当用户明确提出提醒需求，或你能根据上下文合理判断需要提醒吃药、喝水、复诊、休息时调用。必须尽量给出 ISO 时间字符串。
+- create_reminder：当用户明确提出提醒需求，或你能根据上下文合理判断需要提醒吃药、喝水、复诊、休息时调用。
 - create_emergency：当出现高风险表达，或需要留下紧急事件记录时调用。
 - record_note：当用户提到身体不舒服、睡眠、情绪、食欲、活动状态等值得追踪的信息时调用。
 - 可以同时调用多个工具。
-- 如果不需要工具，就返回空数组。
+- 工具调用之后，再向老人说明你已经帮他做了什么。
 
 回复要求：
 - 先安抚，再给一个清晰下一步。
 - 句子短，不要长篇大论。
 - 不要说“作为一个AI”。
 - 不要输出 Markdown。
-
-你必须只返回 JSON，对应以下结构：
-{
-  "assistant_reply": "给老人的最终回复",
-  "risk": true,
-  "tool_calls": [
-    {
-      "name": "create_reminder",
-      "reason": "为什么要调这个工具",
-      "arguments": {
-        "title": "提醒内容",
-        "time": "2026-03-11T20:00:00+08:00"
-      }
-    }
-  ]
-}
 `;
 
-function normalizeDecision(raw: unknown): AgentDecision {
-  const data = (raw ?? {}) as {
-    assistant_reply?: unknown;
-    risk?: unknown;
-    tool_calls?: unknown;
-  };
-
-  const toolCalls = Array.isArray(data.tool_calls)
-    ? data.tool_calls
-        .filter((item): item is { name?: unknown; arguments?: unknown; reason?: unknown } => {
-          return Boolean(item && typeof item === "object");
-        })
-        .map((item): AgentToolCall | null => {
-          if (
-            item.name !== "create_reminder" &&
-            item.name !== "create_emergency" &&
-            item.name !== "record_note"
-          ) {
-            return null;
+const DEEPSEEK_TOOLS: DeepSeekToolDefinition[] = [
+  {
+    type: "function",
+    function: {
+      name: "create_reminder",
+      description: "Create a reminder for medication, drinking water, rest, follow-up, or other timed care tasks.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "Short reminder title shown to the elderly user."
+          },
+          time: {
+            type: "string",
+            description: "Reminder time in ISO-8601 format, preferably with timezone offset."
           }
+        },
+        required: ["title", "time"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_emergency",
+      description: "Create an emergency event when the user's words indicate urgent risk or immediate escalation is needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          triggerText: {
+            type: "string",
+            description: "The symptom or sentence that caused the emergency escalation."
+          },
+          actionText: {
+            type: "string",
+            description: "Short explanation for the record about why this emergency was created."
+          }
+        },
+        required: ["triggerText", "actionText"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "record_note",
+      description: "Record a care note about symptoms, habits, mood, appetite, sleep, or safety-related observations.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: {
+            type: "string",
+            description: "Short Chinese summary of what should be tracked."
+          },
+          category: {
+            type: "string",
+            enum: ["symptom", "habit", "mood", "safety"],
+            description: "Note category."
+          },
+          level: {
+            type: "string",
+            enum: ["normal", "warning"],
+            description: "How serious or noteworthy the note is."
+          }
+        },
+        required: ["summary", "category", "level"],
+        additionalProperties: false
+      }
+    }
+  }
+];
 
-          return {
-            name: item.name,
-            arguments:
-              item.arguments && typeof item.arguments === "object"
-                ? (item.arguments as Record<string, unknown>)
-                : {},
-            reason: typeof item.reason === "string" ? item.reason : undefined
-          };
-        })
-        .filter((item): item is AgentToolCall => item !== null)
-    : [];
+function normalizeToolCallName(name: string): AgentToolCallName | null {
+  if (name === "create_reminder" || name === "create_emergency" || name === "record_note") {
+    return name;
+  }
 
-  return {
-    assistantReply:
-      typeof data.assistant_reply === "string" && data.assistant_reply.trim()
-        ? data.assistant_reply.trim()
-        : "我在这儿。您再跟我说具体一点，我来一步步帮您处理。",
-    risk: Boolean(data.risk),
-    toolCalls
-  };
+  return null;
+}
+
+function parseToolCalls(message: DeepSeekChatMessage | undefined): AgentToolCall[] {
+  if (!message?.tool_calls?.length) {
+    return [];
+  }
+
+  return message.tool_calls
+    .map((item): AgentToolCall | null => {
+      const normalizedName = normalizeToolCallName(item.function.name);
+      if (!normalizedName) {
+        return null;
+      }
+
+      try {
+        const parsedArguments = JSON.parse(item.function.arguments || "{}");
+        return {
+          id: item.id,
+          name: normalizedName,
+          arguments:
+            parsedArguments && typeof parsedArguments === "object"
+              ? (parsedArguments as Record<string, unknown>)
+              : {}
+        };
+      } catch {
+        return {
+          id: item.id,
+          name: normalizedName,
+          arguments: {}
+        };
+      }
+    })
+    .filter((item): item is AgentToolCall => item !== null);
+}
+
+async function requestDeepSeek(options: {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  messages: DeepSeekChatMessage[];
+  tools?: DeepSeekToolDefinition[];
+}): Promise<DeepSeekChatMessage> {
+  const response = await fetch(`${options.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${options.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: options.model,
+      temperature: 0.2,
+      messages: options.messages,
+      tools: options.tools
+    })
+  });
+
+  const payload = (await response.json()) as DeepSeekChatCompletionResponse;
+  if (!response.ok) {
+    throw new Error(payload.error?.message || `DeepSeek API failed (${response.status})`);
+  }
+
+  const message = payload.choices?.[0]?.message;
+  if (!message) {
+    throw new Error("DeepSeek returned empty message");
+  }
+
+  return message;
 }
 
 export async function callDeepSeekCareAgent(options: {
@@ -157,8 +271,9 @@ export async function callDeepSeekCareAgent(options: {
   model: string;
   baseUrl: string;
   context: AgentContext;
+  toolResultsExecutor: (toolCalls: AgentToolCall[]) => Promise<AgentToolResult[]> | AgentToolResult[];
 }): Promise<AgentDecision> {
-  const { apiKey, model, baseUrl, context } = options;
+  const { apiKey, model, baseUrl, context, toolResultsExecutor } = options;
   const messages: DeepSeekChatMessage[] = [
     {
       role: "system",
@@ -170,29 +285,54 @@ export async function callDeepSeekCareAgent(options: {
     }
   ];
 
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages
-    })
+  const firstMessage = await requestDeepSeek({
+    apiKey,
+    model,
+    baseUrl,
+    messages,
+    tools: DEEPSEEK_TOOLS
+  });
+  const toolCalls = parseToolCalls(firstMessage);
+
+  if (toolCalls.length === 0) {
+    return {
+      assistantReply:
+        firstMessage.content?.trim() ||
+        "我在这儿。您再跟我说具体一点，我来一步步帮您处理。",
+      risk: context.heuristicRisk,
+      toolCalls: []
+    };
+  }
+
+  messages.push({
+    role: "assistant",
+    content: firstMessage.content ?? "",
+    tool_calls: firstMessage.tool_calls
   });
 
-  const payload = (await response.json()) as DeepSeekChatCompletionResponse;
-  if (!response.ok) {
-    throw new Error(payload.error?.message || `DeepSeek API failed (${response.status})`);
+  const toolResults = await toolResultsExecutor(toolCalls);
+  for (const result of toolResults) {
+    messages.push({
+      role: "tool",
+      tool_call_id: result.toolCallId,
+      content: result.content
+    });
   }
 
-  const content = payload.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    throw new Error("DeepSeek returned empty content");
-  }
+  const finalMessage = await requestDeepSeek({
+    apiKey,
+    model,
+    baseUrl,
+    messages
+  });
 
-  return normalizeDecision(JSON.parse(content));
+  return {
+    assistantReply:
+      finalMessage.content?.trim() ||
+      firstMessage.content?.trim() ||
+      "我已经先帮您记下来了，您再跟我说具体一点，我继续帮您处理。",
+    risk:
+      context.heuristicRisk || toolCalls.some((item) => item.name === "create_emergency"),
+    toolCalls
+  };
 }
