@@ -39,7 +39,7 @@ interface FamilySummary {
 
 interface TimelineItem {
   id: string;
-  type: "chat" | "reminder" | "emergency";
+  type: "chat" | "reminder" | "emergency" | "record";
   title: string;
   description: string;
   createdAt: string;
@@ -945,3 +945,4 @@ onUnmounted(() => {
     </section>
   </main>
 </template>
+

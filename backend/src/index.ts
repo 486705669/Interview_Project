@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { callDeepSeekCareAgent, type AgentToolCall } from "./agent.js";
 import cors from "cors";
 import express, { type Request, type Response } from "express";
 
@@ -35,9 +36,17 @@ interface EmergencyEvent {
   actionLog: string[];
 }
 
+interface CareNote {
+  id: number;
+  summary: string;
+  category: "symptom" | "habit" | "mood" | "safety";
+  level: "normal" | "warning";
+  createdAt: string;
+}
+
 interface FamilyTimelineItem {
   id: string;
-  type: "chat" | "reminder" | "emergency";
+  type: "chat" | "reminder" | "emergency" | "record";
   title: string;
   description: string;
   createdAt: string;
@@ -67,6 +76,9 @@ const hasFrontendBuild = fs.existsSync(frontendDistDir);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() ?? "";
 const OPENAI_TRANSCRIPTION_MODEL =
   process.env.OPENAI_TRANSCRIPTION_MODEL?.trim() || "gpt-4o-mini-transcribe";
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY?.trim() ?? "";
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat";
+const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com";
 const ALIYUN_NLS_APPKEY = process.env.ALIYUN_NLS_APPKEY?.trim() ?? "";
 const ALIYUN_NLS_TOKEN = process.env.ALIYUN_NLS_TOKEN?.trim() ?? "";
 const ALIYUN_AK_ID =
@@ -80,10 +92,12 @@ const voiceCapabilities = resolveVoiceCapabilities();
 const messages: ChatMessage[] = [];
 const reminders: Reminder[] = [];
 const emergencies: EmergencyEvent[] = [];
+const careNotes: CareNote[] = [];
 
 let messageId = 1;
 let reminderId = 1;
 let emergencyId = 1;
+let careNoteId = 1;
 let aliyunTokenState: AliyunTokenState | null =
   !hasAliyunAutoToken && ALIYUN_NLS_TOKEN
     ? {
@@ -355,6 +369,121 @@ function createEmergency(source: EmergencySource, triggerText: string): Emergenc
   return event;
 }
 
+function createCareNote(
+  summary: string,
+  options?: Partial<Pick<CareNote, "category" | "level">>
+): CareNote {
+  const note: CareNote = {
+    id: careNoteId++,
+    summary,
+    category: options?.category ?? "symptom",
+    level: options?.level ?? "normal",
+    createdAt: new Date().toISOString()
+  };
+  careNotes.unshift(note);
+  return note;
+}
+
+function buildAgentContext(userMessage: string, heuristicRisk: boolean) {
+  return {
+    nowIso: new Date().toISOString(),
+    userMessage,
+    recentMessages: messages.slice(-12).map((item) => ({
+      role: item.role,
+      text: item.text,
+      createdAt: item.createdAt
+    })),
+    reminders: reminders.slice(0, 10).map((item) => ({
+      title: item.title,
+      time: item.time,
+      status: item.status
+    })),
+    emergencies: emergencies.slice(0, 6).map((item) => ({
+      triggerText: item.triggerText,
+      status: item.status,
+      createdAt: item.createdAt
+    })),
+    notes: careNotes.slice(0, 10).map((item) => ({
+      summary: item.summary,
+      level: item.level,
+      category: item.category,
+      createdAt: item.createdAt
+    })),
+    heuristicRisk
+  };
+}
+
+function executeAgentToolCalls(toolCalls: AgentToolCall[], fallbackMessage: string) {
+  const summaries: string[] = [];
+  let createdEmergency = false;
+
+  for (const toolCall of toolCalls.slice(0, 4)) {
+    if (toolCall.name === "create_reminder") {
+      const title = String(toolCall.arguments.title ?? "").trim();
+      const time = String(toolCall.arguments.time ?? "").trim();
+      const parsedTime = new Date(time);
+
+      if (!title || !time || Number.isNaN(parsedTime.getTime())) {
+        continue;
+      }
+
+      reminders.unshift({
+        id: reminderId++,
+        title,
+        time: parsedTime.toISOString(),
+        status: "pending"
+      });
+      summaries.push(`已添加提醒：${title}`);
+      continue;
+    }
+
+    if (toolCall.name === "create_emergency") {
+      const triggerText = String(toolCall.arguments.triggerText ?? fallbackMessage).trim();
+      const actionText = String(toolCall.arguments.actionText ?? "模型判定需要重点关注").trim();
+      const event = createEmergency("keyword", triggerText || fallbackMessage);
+      event.actionLog.push(actionText);
+      summaries.push("已记录紧急事件");
+      createdEmergency = true;
+      continue;
+    }
+
+    if (toolCall.name === "record_note") {
+      const summary = String(toolCall.arguments.summary ?? "").trim();
+      const level = toolCall.arguments.level === "warning" ? "warning" : "normal";
+      const category =
+        toolCall.arguments.category === "habit" ||
+        toolCall.arguments.category === "mood" ||
+        toolCall.arguments.category === "safety"
+          ? toolCall.arguments.category
+          : "symptom";
+
+      if (!summary) {
+        continue;
+      }
+
+      createCareNote(summary, {
+        level,
+        category
+      });
+      summaries.push(`已记录：${summary}`);
+    }
+  }
+
+  return {
+    summaries,
+    createdEmergency
+  };
+}
+
+function mergeReplyWithToolSummary(reply: string, summaries: string[]): string {
+  const normalizedReply = reply.trim();
+  if (summaries.length === 0) {
+    return normalizedReply;
+  }
+
+  return `${normalizedReply}\n\n我已经为您处理：${summaries.join("；")}。`;
+}
+
 function buildFamilyTimeline(): FamilyTimelineItem[] {
   const chatItems: FamilyTimelineItem[] = messages.slice(-40).map((item) => ({
     id: `chat-${item.id}`,
@@ -383,7 +512,16 @@ function buildFamilyTimeline(): FamilyTimelineItem[] {
     level: "warning"
   }));
 
-  return [...chatItems, ...reminderItems, ...emergencyItems].sort((a, b) =>
+  const recordItems: FamilyTimelineItem[] = careNotes.map((item) => ({
+    id: `record-${item.id}`,
+    type: "record",
+    title: "健康记录",
+    description: item.summary,
+    createdAt: item.createdAt,
+    level: item.level
+  }));
+
+  return [...chatItems, ...reminderItems, ...emergencyItems, ...recordItems].sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt)
   );
 }
@@ -508,7 +646,7 @@ app.post(
   }
 );
 
-app.post("/api/chat", (req: Request, res: Response) => {
+app.post("/api/chat", async (req: Request, res: Response) => {
   const message = String(req.body?.message ?? "").trim();
   if (!message) {
     res.status(400).json({ error: "message is required" });
@@ -516,10 +654,33 @@ app.post("/api/chat", (req: Request, res: Response) => {
   }
 
   addChat("user", message);
-  const risk = detectRisk(message);
-  const reply = buildReply(message, risk);
+  const heuristicRisk = detectRisk(message);
+  let reply = buildReply(message, heuristicRisk);
+  let risk = heuristicRisk;
 
-  if (risk) {
+  if (DEEPSEEK_API_KEY) {
+    try {
+      const decision = await callDeepSeekCareAgent({
+        apiKey: DEEPSEEK_API_KEY,
+        model: DEEPSEEK_MODEL,
+        baseUrl: DEEPSEEK_BASE_URL,
+        context: buildAgentContext(message, heuristicRisk)
+      });
+      const toolResult = executeAgentToolCalls(decision.toolCalls, message);
+      risk = heuristicRisk || decision.risk || toolResult.createdEmergency;
+
+      if (risk && !toolResult.createdEmergency) {
+        createEmergency("keyword", message);
+      }
+
+      reply = mergeReplyWithToolSummary(decision.assistantReply, toolResult.summaries);
+    } catch (error) {
+      console.error("deepseek chat failed", error);
+      if (risk) {
+        createEmergency("keyword", message);
+      }
+    }
+  } else if (risk) {
     createEmergency("keyword", message);
   }
 
@@ -647,5 +808,8 @@ app.listen(PORT, () => {
   console.log(`voice transcription provider: ${voiceCapabilities.provider}`);
   if (voiceCapabilities.provider === "aliyun-nls" && hasAliyunAutoToken) {
     console.log("aliyun nls token mode: auto-refresh via AccessKey");
+  }
+  if (DEEPSEEK_API_KEY) {
+    console.log(`deepseek agent enabled: ${DEEPSEEK_MODEL}`);
   }
 });

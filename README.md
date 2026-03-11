@@ -98,6 +98,20 @@ OPENAI_API_KEY=your_api_key
 OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ```
 
+## DeepSeek Agent Branch
+The branch `codex/deepseek-agent-upgrade` upgrades `/api/chat` to a DeepSeek-powered agent flow:
+- the model replies as the companion assistant
+- the model can decide to create reminders, record health notes, or open emergency events
+- the original rule-based logic remains as a fallback when the model is unavailable
+
+Environment variables:
+
+```text
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+```
+
 ## Current MVP Status
 - [x] PRD and delivery plan
 - [x] Frontend pages: chat / reminder / logs / family dashboard / emergency detail
